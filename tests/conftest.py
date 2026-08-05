@@ -17,6 +17,37 @@ CHUNK_DIR = os.path.realpath(tempfile.gettempdir())
 CHUNK_DIRECTORY_URL_PREFIX = f"file://{CHUNK_DIR}/"
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--network",
+        action="store_true",
+        default=False,
+        help="also run tests that read real NAQFC GRIB2 files from S3",
+    )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers", "network: reads real NAQFC GRIB2 files from the public S3 bucket"
+    )
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    """Skip network tests unless asked for.
+
+    NAQFC publishes no `.idx` sidecars, so opening one cycle transfers the whole
+    ~86 MB object. That is worth paying deliberately, not on every test run.
+    """
+    if config.getoption("--network"):
+        return
+    skip = pytest.mark.skip(reason="needs --network (downloads ~86 MB per cycle)")
+    for item in items:
+        if "network" in item.keywords:
+            item.add_marker(skip)
+
+
 def fake_vds(date: str) -> xr.Dataset:
     filepath = f"{CHUNK_DIR}/data_chunk"
     store = obstore.store.LocalStore()
@@ -94,6 +125,23 @@ def icechunk_repo() -> icechunk.Repository:
 @pytest.fixture(scope="function")
 def icechunk_session() -> icechunk.Session:
     return create_session()
+
+
+@pytest.fixture(scope="function")
+def naqfc_repo(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> icechunk.Repository:
+    """A filesystem-backed repo configured by the NAQFC processor itself.
+
+    Distinct from `backfill_repo`, whose virtual chunk container points at local
+    files for the stub processor. NAQFC chunks live in NOAA's bucket, and
+    virtualizarr refuses to write a reference whose prefix no container covers.
+    """
+    from virtualizarr_processor.processor import Processor
+
+    monkeypatch.delenv("ICECHUNK_BUCKET", raising=False)
+    monkeypatch.setenv("ICECHUNK_LOCAL_PATH", str(tmp_path / "repo"))
+    return Processor().open_backfill_repo()
 
 
 @pytest.fixture(scope="function")

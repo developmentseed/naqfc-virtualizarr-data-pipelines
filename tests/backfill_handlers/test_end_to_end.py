@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import zarr
 from backfill_handlers import fork, init, inventory, partition, promote, reduce, worker
-from virtualizarr_processor.processor import Processor
+from stub_processor import StubProcessor
 
 
 def test_full_backfill_chain(
@@ -64,6 +64,6 @@ def test_full_backfill_chain(
 
     # promote and verify all 6 slices on main
     promote.handler({}, lambda_context)
-    repo = Processor().open_backfill_repo()
+    repo = StubProcessor().open_backfill_repo()
     arr = zarr.open_group(repo.readonly_session("main").store, mode="r")["foo"]
     assert (np.asarray(arr[:]) == np.arange(6)[:, None, None]).all()

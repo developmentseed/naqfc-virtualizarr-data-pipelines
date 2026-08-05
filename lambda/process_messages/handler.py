@@ -38,7 +38,10 @@ def process_notification(
             "Append file",
             extra={"bucket": bucket, "key": key, "s3_uri": s3_uri},
         )
-        processor.process_file(file_key=key, session=session)
+        # The full URI, not the bare key: the processor hands this straight to
+        # the virtual dataset opener, which needs the scheme and bucket to
+        # resolve the object.
+        processor.process_file(file_key=s3_uri, session=session)
         logger.info(f"{s3_uri} successfully processed")
 
 

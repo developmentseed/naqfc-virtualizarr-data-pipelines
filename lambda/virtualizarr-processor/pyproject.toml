@@ -5,7 +5,9 @@ description = "Module for ingesting virtualizarr data to Icechunk"
 requires-python = ">=3.12"
 dependencies = [
     "icechunk>=2.1",
-    "virtualizarr>=2.7",
+    # [grib] pulls gribberish, the GRIB2 reader/codec NAQFC files are parsed and
+    # decoded with. Reads go through obstore, which virtualizarr already brings.
+    "virtualizarr[grib]>=2.7.1",
     "zarr>=3.2.1",
 ]
 

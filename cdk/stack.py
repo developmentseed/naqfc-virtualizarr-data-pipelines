@@ -48,6 +48,12 @@ from constructs import Construct
 from settings import StackSettings  # type: ignore[import-not-found]
 from stack_constructs import BackfillPipeline, BatchInfra, BatchJob
 
+# The SNS filter must admit exactly the files the processor can ingest, so the
+# pattern is derived from the same dataset constants the processor uses rather
+# than restated here. A drift between the two fails silently: the queue would
+# either starve or take in files the worker then rejects.
+from virtualizarr_processor import naqfc
+
 
 class VirtualizarrSqsStack(Stack):
     def __init__(
@@ -126,10 +132,33 @@ class VirtualizarrSqsStack(Stack):
                 topic_arn=settings.SNS_TOPIC,
             )
 
+            # The NewNWSAirQualityObject topic announces every NWS air quality
+            # object: AQMv5/6/7, all three domains, PM2.5 and smoke as well as
+            # ozone. Only one product belongs in this store, so the subscription
+            # filters at the topic rather than enqueuing everything and
+            # discarding it in the consumer.
+            #
+            # Scope is MessageBody, not the default MessageAttributes: S3 event
+            # notifications carry the key in the payload and set no attributes
+            # to match on. Payload-based filtering is also what allows the
+            # nested path below -- attribute-based filtering rejects nested
+            # policies outright.
+            # Reads as the path through the S3 event payload:
+            # Records[].s3.object.key
+            key_matches = sns.FilterOrPolicy.filter(
+                sns.SubscriptionFilter(
+                    conditions=[{"wildcard": naqfc.object_key_wildcard()}]
+                )
+            )
+            object_key = sns.FilterOrPolicy.policy({"key": key_matches})
+            s3_object = sns.FilterOrPolicy.policy({"object": object_key})
+            records = sns.FilterOrPolicy.policy({"s3": s3_object})
+
             self.sns_topic.add_subscription(
                 subscriptions.SqsSubscription(
                     self.queue,
                     raw_message_delivery=True,
+                    filter_policy_with_message_body={"Records": records},
                 )
             )
 

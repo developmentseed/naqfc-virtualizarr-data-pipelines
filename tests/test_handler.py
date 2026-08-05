@@ -63,11 +63,13 @@ def test_handler_processes_all_records(MockProcessor: MagicMock) -> None:
     # No failures expected
     assert response["batchItemFailures"] == []
 
-    # Verify process_file was called for each record
+    # Verify process_file was called for each record, with the full s3:// URI
+    # rather than the bare key -- the processor passes this straight to the
+    # virtual dataset opener, which needs the scheme and bucket to resolve it.
     assert mock_processor.process_file.call_count == 2
     calls = mock_processor.process_file.call_args_list
-    assert calls[0].kwargs["file_key"] == "2024-01-02"
-    assert calls[1].kwargs["file_key"] == "2024-01-03"
+    assert calls[0].kwargs["file_key"] == "s3://test-bucket/2024-01-02"
+    assert calls[1].kwargs["file_key"] == "s3://test-bucket/2024-01-03"
 
     # Verify commit was called once
     mock_processor.commit_processed_files.assert_called_once_with(session=mock_session)
