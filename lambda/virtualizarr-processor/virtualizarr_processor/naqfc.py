@@ -25,7 +25,7 @@ pulling the parser stack.
 from __future__ import annotations
 
 from datetime import date, timedelta
-from typing import TYPE_CHECKING, Any, Iterator, cast
+from typing import TYPE_CHECKING, Any, Iterator
 
 if TYPE_CHECKING:
     import numpy as np
@@ -72,7 +72,7 @@ DIMS = ("reference_time", "lead", "y", "x")
 # fork would otherwise write byte-identical chunks to the same coordinate
 # array, and Icechunk treats concurrent writes to one chunk as a merge
 # conflict regardless of whether the bytes agree.
-STATIC_COORDS = ("y", "x", "latitude", "longitude", "spatial_ref", "valid_time")
+STATIC_COORDS = ("y", "x", "latitude", "longitude", "spatial_ref")
 
 
 class UnsupportedProductError(ValueError):
@@ -213,19 +213,11 @@ def lead_axis(lead_hours: int | None = None) -> "np.ndarray":
     )
 
 
-def valid_time_grid(reference_times: "np.ndarray", lead: "np.ndarray") -> "np.ndarray":
-    """The 2-D `valid_time` coordinate, derived rather than read.
-
-    valid = reference_time + lead hours, which holds for every cycle, so the
-    initializer can write this in full without touching a single GRIB file.
-    """
-    grid = (
-        reference_times[:, None]
-        + lead.astype("timedelta64[h]").astype("timedelta64[ns]")[None, :]
-    )
-    # cast: pre-commit runs mypy without numpy, so the arithmetic is Any there
-    # and warn_return_any flags a bare return.
-    return cast("np.ndarray", grid)
+# NB: the store deliberately carries no `valid_time` coordinate. It is exactly
+# `reference_time + lead`, so writing it would store 2-D redundant data that has
+# to be kept consistent on every append. Consumers derive it in one line:
+#
+#     valid_time = cube.reference_time + cube.lead.astype("timedelta64[h]")
 
 
 # --- virtual dataset construction ------------------------------------------
@@ -261,15 +253,16 @@ def open_cycle(url: str, reg: Any = None, prs: Any = None) -> "xr.Dataset":
 
 
 def pin_time_encoding(cube: "xr.Dataset") -> "xr.Dataset":
-    """Pin absolute units on the time coordinates.
+    """Pin absolute units on `reference_time`.
 
     Without this, a store whose first-written `reference_time` holds a single
     value gets `units="days since <that cycle>"` inferred, and every later
     value is written under those units and reads back wildly wrong.
     """
-    for name in ("reference_time", "valid_time"):
-        if name in cube.coords:
-            cube[name].encoding.update(units="hours since 1970-01-01", dtype="int64")
+    if "reference_time" in cube.coords:
+        cube["reference_time"].encoding.update(
+            units="hours since 1970-01-01", dtype="int64"
+        )
     return cube
 
 
@@ -308,7 +301,6 @@ def cycle_cube(
         vds.rename({"time": "lead"})
         .assign_coords(lead=("lead", lead))
         .expand_dims(reference_time=[ref])
-        .assign_coords(valid_time=(("reference_time", "lead"), valid[None, :]))
     )
     # Per-cycle provenance; leaving it on would label the whole store with
     # whichever cycle happened to be written first.
@@ -366,10 +358,6 @@ def full_shape_skeleton(
         coords={
             "reference_time": ("reference_time", reference_times),
             "lead": ("lead", np.asarray(lead)),
-            "valid_time": (
-                ("reference_time", "lead"),
-                valid_time_grid(reference_times, lead),
-            ),
             # Grid coordinates carried straight over: y/x are real arrays,
             # latitude/longitude/spatial_ref stay virtual references into the
             # cycle they came from.

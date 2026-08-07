@@ -95,9 +95,9 @@ class Processor:
 
         Reads exactly one cycle, for two things it cannot invent: the grid
         coordinates, and the `ozcon` array metadata carrying the gribberish
-        codec. Everything else -- the reference_time axis, the lead axis, the
-        derived valid_time grid -- is computed from configuration, which is why
-        this never needs the inventory.
+        codec. Everything else -- the reference_time axis and the lead axis --
+        is computed from configuration, which is why this never needs the
+        inventory.
 
         Commits and leaves nothing pending: workers fork from this snapshot, and
         a fork is only mergeable if its base is a clean committed snapshot.

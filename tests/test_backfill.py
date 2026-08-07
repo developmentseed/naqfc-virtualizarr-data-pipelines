@@ -159,18 +159,24 @@ def test_skeleton_pins_absolute_time_units() -> None:
         refs, naqfc.lead_axis(3), _fake_reference_cube()
     )
 
-    for name in ("reference_time", "valid_time"):
-        assert skeleton[name].encoding["units"] == "hours since 1970-01-01"
+    assert skeleton["reference_time"].encoding["units"] == "hours since 1970-01-01"
 
 
-def test_skeleton_valid_time_is_derived() -> None:
+def test_skeleton_carries_no_valid_time() -> None:
+    """valid_time is reference_time + lead. Storing it would duplicate a 2-D
+    coordinate that every append then has to keep in step; consumers derive it."""
     refs = naqfc.cycle_reference_times("2025-01-01", "2025-01-01", ("06", "12"))
-    lead = naqfc.lead_axis(3)
 
-    skeleton = naqfc.full_shape_skeleton(refs, lead, _fake_reference_cube())
+    skeleton = naqfc.full_shape_skeleton(
+        refs, naqfc.lead_axis(3), _fake_reference_cube()
+    )
 
-    assert skeleton.valid_time.dims == ("reference_time", "lead")
-    assert skeleton.valid_time.values[1, 2] == refs[1] + np.timedelta64(3, "h")
+    assert "valid_time" not in skeleton.variables
+    # What a consumer computes instead. Both operands must stay DataArrays --
+    # mixing in a raw ndarray fails to broadcast across the two dims.
+    derived = skeleton.reference_time + skeleton.lead.astype("timedelta64[h]")
+    assert derived.dims == ("reference_time", "lead")
+    assert derived.values[1, 2] == refs[1] + np.timedelta64(3, "h")
 
 
 # --- NAQFC region writes (network) -----------------------------------------
@@ -224,6 +230,10 @@ def test_two_cycles_write_disjoint_regions(
         assert int(np.count_nonzero(~np.isnan(point.isel(reference_time=row)))) == (
             naqfc.LEAD_HOURS
         )
-    assert (
-        len(np.intersect1d(cube.valid_time.values[0], cube.valid_time.values[1])) == 66
+    assert "valid_time" not in cube.variables
+    # The overlap the 2-D layout preserves, from derived valid times.
+    valid = (
+        cube.reference_time.values[:, None]
+        + cube.lead.values.astype("timedelta64[h]")[None, :]
     )
+    assert len(np.intersect1d(valid[0], valid[1])) == 66

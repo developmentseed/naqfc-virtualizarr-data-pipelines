@@ -61,14 +61,12 @@ def test_reference_times_align_with_inventory_order() -> None:
         )
 
 
-def test_valid_time_grid_is_reference_plus_lead() -> None:
-    refs = naqfc.cycle_reference_times("2025-01-01", "2025-01-01", ("06", "12"))
-    lead = naqfc.lead_axis(72)
-    grid = naqfc.valid_time_grid(refs, lead)
-
-    assert grid.shape == (2, 72)
-    assert grid[0, 0] == refs[0] + np.timedelta64(1, "h")
-    assert grid[1, -1] == refs[1] + np.timedelta64(72, "h")
+def test_no_valid_time_coordinate_is_written() -> None:
+    """valid_time is exactly reference_time + lead, so the store doesn't carry
+    it -- a 2-D redundant coordinate would have to be kept consistent on every
+    append. Consumers derive it instead."""
+    assert not hasattr(naqfc, "valid_time_grid")
+    assert "valid_time" not in naqfc.STATIC_COORDS
 
 
 def test_leap_day_included() -> None:
