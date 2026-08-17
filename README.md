@@ -206,17 +206,18 @@ To configure each variable/domain pipeline stack you need to
     uv run --env-file .env_o3_conus cdk deploy
     ```
 3. Create an inventory file in an accessible location for o3/Conus data.  This repo includes a helper script for doing this.  Run
-   ```bash
+    ```bash
     uv run scripts/generate_inventory.py \
-  --domains CS --products ave_1hr_o3 \
-  --start 2024-05-14 --end 2026-08-17 --verify \
-  --upload s3://your-bucket/inventory/
-  ```
+      --domains CS --products ave_1hr_o3 \
+      --start 2024-05-14 --end 2026-08-17 --verify \
+      --upload s3://your-bucket/inventory/
+    ```
 4. With the inventory created, you can initiate a backfill run that uses the inventory to virtualize all the referenced files. Run
     ```bash
-    ./scripts/start_backfill.sh -e .env_o3_conus o3_conus s3://your-bucket/inventory/naqfc_aqmv7_ak_ave_1hr_o3_20240514_20260817.json
+    ./scripts/start_backfill.sh -e .env_o3_conus o3-conus-20260817 \
+      s3://your-bucket/inventory/naqfc_aqmv7_cs_ave_1hr_o3_20240514_20260817.json
     ```
 
-5. Once the backfill is successfully completed, the pipeline stack can begin processing messages added to the forward processing queue. Edit `.env_o3_conus` set `AFORWARD_QUEUE_ENABLED=true` and re-deploy and your stack will now automatically process incoming messages.
+5. Once the backfill is successfully completed, the pipeline stack can begin processing messages added to the forward processing queue. Edit `.env_o3_conus` set `FORWARD_QUEUE_ENABLED=true` and re-deploy and your stack will now automatically process incoming messages.
 
 6. Now you can repeat the steps for each variable/domain combination so that you have 6 individual pipeline stacks / icechunk stores.
