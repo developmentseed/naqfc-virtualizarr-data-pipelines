@@ -7,6 +7,7 @@ dependencies = [
     "icechunk>=2.1",
     # [grib] pulls gribberish, the GRIB2 reader/codec NAQFC files are parsed and
     # decoded with. Reads go through obstore, which virtualizarr already brings.
+    "gribberish>=1.7.0",
     "virtualizarr[grib]>=2.7.1",
     "zarr>=3.2.1",
 ]

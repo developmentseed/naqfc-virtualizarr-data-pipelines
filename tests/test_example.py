@@ -46,9 +46,10 @@ def test_cycles_are_chronological_and_complete() -> None:
 
 
 def test_reference_times_align_with_inventory_order() -> None:
-    """The store's reference_time axis and the inventory must be the same
-    enumeration. Nothing downstream re-checks this: a drift would silently send
-    region writes to the wrong rows."""
+    """The store's reference_time axis and the inventory must describe the same
+    cycles. region="auto" aligns by coordinate value, so an inventory cycle
+    missing from the axis fails loudly -- but an axis row missing from the
+    inventory is silent, leaving an empty row nothing reports."""
     args = ("2025-01-01", "2025-01-04", ("06", "12"))
     urls = naqfc.cycle_urls(*args)
     refs = naqfc.cycle_reference_times(*args)
@@ -75,13 +76,33 @@ def test_leap_day_included() -> None:
     assert len(urls) == 3
 
 
-def test_unsupported_product_rejected() -> None:
-    with pytest.raises(naqfc.UnsupportedProductError, match="pm25|scan_grib"):
-        naqfc.check_product("ave_1hr_pm25")
+def test_grid_derives_from_domain() -> None:
+    """Grid and domain are not independent -- a mismatched pair builds URLs that
+    resolve to nothing, so the grid follows the domain unless overridden."""
+    assert naqfc.grid_for_domain("CS") == "227"  # Lambert conformal
+    assert naqfc.grid_for_domain("AK") == "198"  # polar stereographic
+    assert naqfc.grid_for_domain("HI") == "196"  # Mercator
+    assert naqfc.grid_for_domain("CS", "999") == "999"  # explicit override wins
 
 
-def test_supported_product_accepted() -> None:
-    naqfc.check_product("ave_1hr_o3")
+def test_other_domains_and_products_build_urls() -> None:
+    """One deployment per (domain, product); the URL pattern follows both."""
+    ak = naqfc.cycle_urls("2025-06-01", "2025-06-01", ("06",), domain="AK", grid="198")[
+        0
+    ]
+    assert ak.endswith("AQMv7/AK/20250601/06/aqm.t06z.ave_1hr_o3.20250601.198.grib2")
+
+    hi_pm25 = naqfc.cycle_urls(
+        "2025-06-01",
+        "2025-06-01",
+        ("06",),
+        domain="HI",
+        grid="196",
+        product="ave_1hr_pm25",
+    )[0]
+    assert hi_pm25.endswith(
+        "AQMv7/HI/20250601/06/aqm.t06z.ave_1hr_pm25.20250601.196.grib2"
+    )
 
 
 # --- repository plumbing ---------------------------------------------------

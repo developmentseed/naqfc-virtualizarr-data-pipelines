@@ -35,6 +35,7 @@ class BackfillPipeline(Construct):
         partition_size: int,
         max_items_per_batch: int,
         max_concurrency: int,
+        naqfc_env: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -50,6 +51,11 @@ class BackfillPipeline(Construct):
             env["ICECHUNK_PREFIX"] = icechunk_prefix
         if earthdata_secret_arn:
             env["EARTHDATA_SECRET_ARN"] = earthdata_secret_arn
+        # Which slice of NAQFC this stack serves. The init handler builds the
+        # store's reference_time axis from these, so they must reach it -- an
+        # init Lambda running on defaults would declare a CONUS-shaped store for
+        # an AK deployment.
+        env.update(naqfc_env or {})
 
         earthdata_secret = (
             secretsmanager.Secret.from_secret_complete_arn(

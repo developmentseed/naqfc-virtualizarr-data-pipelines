@@ -66,7 +66,6 @@ class Processor:
         virtual chunk container for it plus credentials -- anonymous here, since
         the NAQFC bucket is public.
         """
-        naqfc.check_product()
         prefix = source_prefix()
         config = icechunk.RepositoryConfig.default()
         config.set_virtual_chunk_container(

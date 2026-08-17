@@ -15,12 +15,19 @@ The output is a JSON array of ``s3://`` URIs, sorted chronologically by
 chunks and each chunk becomes one commit against a disjoint region, so the
 ordering here determines the region layout.
 
+One inventory file is written per domain x product, matching the deployment
+model: one stack per (domain, product) pair, each with its own store. The grid
+follows the domain (CS=227 Lambert, AK=198 polar stereographic, HI=196
+Mercator), so selecting a domain is enough.
+
 Usage:
     uv run scripts/generate_inventory.py
     uv run scripts/generate_inventory.py --verify \
         --upload s3://my-icechunk-bucket/inventory/
-    uv run scripts/generate_inventory.py --start 2025-06-01 --end 2025-06-30 \
+    uv run scripts/generate_inventory.py --domains AK HI \
         --products ave_1hr_o3 ave_1hr_pm25
+    uv run scripts/generate_inventory.py --start 2025-06-01 --end 2025-06-30 \
+        --domains CS --products ave_1hr_o3
 """
 
 from __future__ import annotations
@@ -39,15 +46,16 @@ from typing import Any
 from virtualizarr_processor import naqfc
 
 DEFAULT_PRODUCTS = (naqfc.PRODUCT,)
+DEFAULT_DOMAINS = (naqfc.DOMAIN,)
 
 # Matches BACKFILL_PARTITION_SIZE's default in cdk/settings.py; used only to
 # report how many commits the inventory will produce.
 DEFAULT_PARTITION_SIZE = 500
 
 
-def day_prefix(day: date, bucket: str, domain: str) -> str:
+def day_prefix(day: date, bucket: str, collection: str, domain: str) -> str:
     """Return the ``s3://`` prefix holding every cycle for one day."""
-    return f"s3://{bucket}/{naqfc.COLLECTION}/{domain}/{day:%Y%m%d}/"
+    return f"s3://{bucket}/{collection}/{domain}/{day:%Y%m%d}/"
 
 
 def s3_client() -> Any:
@@ -76,9 +84,13 @@ def list_existing(prefixes: list[str], workers: int) -> set[str]:
         return {uri for batch in pool.map(one, prefixes) for uri in batch}
 
 
-def verify(uris: list[str], prefixes: list[str], workers: int) -> list[str]:
-    """Drop URIs with no matching object, reporting what was removed."""
-    existing = list_existing(prefixes, workers)
+def drop_missing(uris: list[str], existing: set[str]) -> list[str]:
+    """Drop URIs with no matching object, reporting what was removed.
+
+    Takes an already-listed set rather than doing the listing: one day prefix
+    holds every product for that domain, so the listing is shared across
+    products instead of repeated per product.
+    """
     present = [uri for uri in uris if uri in existing]
     missing = [uri for uri in uris if uri not in existing]
     if missing:
@@ -113,8 +125,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start", default=naqfc.START, help="YYYY-MM-DD inclusive")
     parser.add_argument("--end", default=naqfc.END, help="YYYY-MM-DD inclusive")
     parser.add_argument("--bucket", default=naqfc.BUCKET)
-    parser.add_argument("--domain", default=naqfc.DOMAIN, help="CS, AK or HI")
-    parser.add_argument("--grid", default=naqfc.GRID)
+    parser.add_argument("--collection", default=naqfc.COLLECTION, help="e.g. AQMv7")
+    parser.add_argument(
+        "--domains",
+        nargs="+",
+        default=list(DEFAULT_DOMAINS),
+        help=f"one or more of {sorted(naqfc.GRID_BY_DOMAIN)}; one inventory is "
+        f"written per domain x product",
+    )
+    parser.add_argument(
+        "--grid",
+        help="NCEP grid ID. Normally omitted -- it follows the domain "
+        f"({', '.join(f'{d}={g}' for d, g in sorted(naqfc.GRID_BY_DOMAIN.items()))}). "
+        f"Setting it applies to every --domains value, so only use it with one.",
+    )
     parser.add_argument("--cycles", nargs="+", default=list(naqfc.CYCLES))
     parser.add_argument("--products", nargs="+", default=list(DEFAULT_PRODUCTS))
     parser.add_argument("--out-dir", type=Path, default=Path("inventory"))
@@ -143,51 +167,67 @@ def main() -> None:
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     cycles = tuple(args.cycles)
-    prefixes = [
-        day_prefix(day, args.bucket, args.domain)
-        for day in naqfc.days(args.start, args.end)
-    ]
+    days = naqfc.days(args.start, args.end)
 
-    for product in args.products:
-        print(f"\n{product}:")
-        uris = naqfc.cycle_urls(
-            args.start,
-            args.end,
-            cycles,
-            bucket=args.bucket,
-            domain=args.domain,
-            product=product,
-            grid=args.grid,
-        )
-        print(f"  {len(uris)} file(s) from the pattern")
+    for domain in args.domains:
+        # Grid and domain are not independent (CS=227 Lambert, AK=198 polar
+        # stereographic, HI=196 Mercator). Deriving it here is what keeps
+        # --domains AK from silently emitting CONUS-grid URLs that match no
+        # object -- a mistake --verify would catch but plain generation would not.
+        grid = naqfc.grid_for_domain(domain, args.grid)
 
+        # One listing per day serves every product in that domain, so verify
+        # once per domain rather than once per product.
+        existing = None
         if args.verify:
-            print(f"  verifying against {len(prefixes)} day prefix(es)...")
-            uris = verify(uris, prefixes, args.workers)
+            prefixes = [
+                day_prefix(day, args.bucket, args.collection, domain) for day in days
+            ]
+            print(f"\n{domain}: verifying against {len(prefixes)} day prefix(es)...")
+            existing = list_existing(prefixes, args.workers)
 
-        if not uris:
-            print("  nothing to write, skipping")
-            continue
+        for product in args.products:
+            print(f"\n{domain} / {product} (grid {grid}):")
+            uris = naqfc.cycle_urls(
+                args.start,
+                args.end,
+                cycles,
+                bucket=args.bucket,
+                collection=args.collection,
+                domain=domain,
+                product=product,
+                grid=grid,
+            )
+            print(f"  {len(uris)} file(s) from the pattern")
 
-        name = (
-            f"naqfc_{naqfc.COLLECTION.lower()}_{args.domain.lower()}_{product}"
-            f"_{start:%Y%m%d}_{end:%Y%m%d}.json"
-        )
-        local = args.out_dir / name
-        local.write_text(json.dumps(uris, indent=2))
+            if existing is not None:
+                uris = drop_missing(uris, existing)
 
-        partitions = -(-len(uris) // args.partition_size)
-        print(f"  wrote {local} ({len(uris)} files, {partitions} partitions/commits)")
-        print(f"  first: {uris[0]}")
-        print(f"  last:  {uris[-1]}")
+            if not uris:
+                print("  nothing to write, skipping")
+                continue
 
-        inventory_uri = upload(local, args.upload) if args.upload else None
-        if inventory_uri:
-            print(f"  uploaded to {inventory_uri}")
-        print(
-            "\n  ./scripts/start_backfill.sh <execution-name> "
-            f"{inventory_uri or '<inventory-uri>'}"
-        )
+            name = (
+                f"naqfc_{args.collection.lower()}_{domain.lower()}_{product}"
+                f"_{start:%Y%m%d}_{end:%Y%m%d}.json"
+            )
+            local = args.out_dir / name
+            local.write_text(json.dumps(uris, indent=2))
+
+            partitions = -(-len(uris) // args.partition_size)
+            print(
+                f"  wrote {local} ({len(uris)} files, {partitions} partitions/commits)"
+            )
+            print(f"  first: {uris[0]}")
+            print(f"  last:  {uris[-1]}")
+
+            inventory_uri = upload(local, args.upload) if args.upload else None
+            if inventory_uri:
+                print(f"  uploaded to {inventory_uri}")
+            print(
+                "\n  ./scripts/start_backfill.sh <execution-name> "
+                f"{inventory_uri or '<inventory-uri>'}"
+            )
 
 
 if __name__ == "__main__":

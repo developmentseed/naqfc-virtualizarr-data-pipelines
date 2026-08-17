@@ -48,12 +48,6 @@ from constructs import Construct
 from settings import StackSettings  # type: ignore[import-not-found]
 from stack_constructs import BackfillPipeline, BatchInfra, BatchJob
 
-# The SNS filter must admit exactly the files the processor can ingest, so the
-# pattern is derived from the same dataset constants the processor uses rather
-# than restated here. A drift between the two fails silently: the queue would
-# either starve or take in files the worker then rejects.
-from virtualizarr_processor import naqfc
-
 
 class VirtualizarrSqsStack(Stack):
     def __init__(
@@ -117,6 +111,24 @@ class VirtualizarrSqsStack(Stack):
         if settings.EARTHDATA_SECRET_ARN:
             self.processor_env["EARTHDATA_SECRET_ARN"] = settings.EARTHDATA_SECRET_ARN
 
+        # Which slice of NAQFC this stack serves; forwarded into every Lambda so
+        # the processor and the backfill initializer agree on the dataset.
+        # NAQFC_GRID is resolved from the domain by StackSettings when unset.
+        self.naqfc_env = {
+            "NAQFC_DATA_BUCKET": settings.NAQFC_DATA_BUCKET,
+            "NAQFC_SOURCE_REGION": settings.NAQFC_SOURCE_REGION,
+            "NAQFC_COLLECTION": settings.NAQFC_COLLECTION,
+            "NAQFC_DOMAIN": settings.NAQFC_DOMAIN,
+            "NAQFC_GRID": settings.NAQFC_GRID or "",
+            "NAQFC_PRODUCT": settings.NAQFC_PRODUCT,
+            "NAQFC_VARIABLE": settings.NAQFC_VARIABLE,
+            "NAQFC_CYCLES": settings.NAQFC_CYCLES,
+            "NAQFC_START": settings.NAQFC_START,
+            "NAQFC_END": settings.NAQFC_END,
+            "NAQFC_LEAD_HOURS": str(settings.NAQFC_LEAD_HOURS),
+        }
+        self.processor_env.update(self.naqfc_env)
+
         self.earthdata_secret = (
             secretsmanager.Secret.from_secret_complete_arn(
                 self, "EarthdataSecret", settings.EARTHDATA_SECRET_ARN
@@ -147,7 +159,7 @@ class VirtualizarrSqsStack(Stack):
             # Records[].s3.object.key
             key_matches = sns.FilterOrPolicy.filter(
                 sns.SubscriptionFilter(
-                    conditions=[{"wildcard": naqfc.object_key_wildcard()}]
+                    conditions=[{"wildcard": settings.NAQFC_KEY_PATTERN}]
                 )
             )
             object_key = sns.FilterOrPolicy.policy({"key": key_matches})
@@ -333,6 +345,7 @@ class VirtualizarrSqsStack(Stack):
                 max_items_per_batch=settings.BACKFILL_MAX_ITEMS_PER_BATCH,
                 max_concurrency=settings.BACKFILL_MAX_CONCURRENCY,
                 earthdata_secret_arn=settings.EARTHDATA_SECRET_ARN,
+                naqfc_env=self.naqfc_env,
             )
 
             CfnOutput(

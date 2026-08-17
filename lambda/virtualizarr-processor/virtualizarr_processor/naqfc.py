@@ -2,15 +2,22 @@
 
 This module is the single source of truth for the ``(reference_time, lead)``
 axis. It matters that it is: ``initialize_backfill_store`` never sees the
-inventory -- it is handed only a Repository -- so it must reconstruct the
-``reference_time`` axis independently. If the axis it builds and the inventory
-the workers consume were derived separately, a drift between them would not
-raise; ``region="auto"`` would resolve each cycle against whatever axis the
-store happens to have and land the write in the wrong row.
+inventory -- it is handed only a Repository -- so it reconstructs the
+``reference_time`` axis from configuration while the workers consume a
+separately generated inventory. The two have to describe the same set of cycles.
+
+``region="auto"`` aligns by coordinate *value*, so the two failure modes are
+asymmetric:
+
+* a cycle in the inventory but **not** in the axis fails loudly, with
+  ``KeyError: Not all values of coordinate 'reference_time' ... were found``.
+  Nothing lands in the wrong row.
+* a cycle in the axis but **not** in the inventory is silent -- that row simply
+  stays empty, and only reading it back reveals the hole.
 
 So both sides go through here: ``initialize_backfill_store`` calls
 ``cycle_reference_times()`` and ``scripts/generate_inventory.py`` calls
-``cycle_urls()``, and the two are the same enumeration in the same order.
+``cycle_urls()``, which keeps the extent and the file list in step.
 
 Layout on the public bucket::
 
@@ -24,6 +31,7 @@ pulling the parser stack.
 
 from __future__ import annotations
 
+import os
 from datetime import date, timedelta
 from typing import TYPE_CHECKING, Any, Iterator
 
@@ -32,38 +40,54 @@ if TYPE_CHECKING:
     import xarray as xr
 
 # --- dataset configuration -------------------------------------------------
-# The 2025 AQMv7 CONUS hourly-ozone archive. This repo is a per-dataset fork of
-# the pipeline template, so the dataset it serves is a property of the code
-# rather than of the deployment.
+# One deployment serves one (domain, product) pair. Defaults describe the 2025
+# AQMv7 CONUS hourly-ozone archive; every value is overridable by environment
+# variable so AK/HI and other products can be deployed as separate stacks
+# against separate stores. The CDK forwards these into every Lambda.
+#
+# The SNS subscription filter is configured separately, as NAQFC_KEY_PATTERN in
+# StackSettings, and is NOT derived from these values -- keep the two in step by
+# hand when retargeting a deployment.
+#
+# Read at import: set them in the Lambda environment (via .env -> StackSettings),
+# not at runtime.
 
-BUCKET = "noaa-nws-naqfc-pds"
-SOURCE_REGION = "us-east-1"
-COLLECTION = "AQMv7"
-DOMAIN = "CS"  # CONUS; AK and HI are separate grids
-GRID = "227"  # NCEP grid ID: 5 km Lambert conformal over CONUS
-PRODUCT = "ave_1hr_o3"
-CYCLES = ("06", "12")
+# NCEP grid IDs are a property of the domain, not an independent choice. Setting
+# one without the other yields URLs that resolve to nothing, so the grid is
+# derived unless explicitly overridden.
+GRID_BY_DOMAIN = {"CS": "227", "AK": "198", "HI": "196"}
+
+
+def grid_for_domain(domain: str, explicit: str | None = None) -> str:
+    """The NCEP grid ID that appears in a domain's filenames."""
+    if explicit:
+        return explicit
+    return GRID_BY_DOMAIN.get(domain, "")
+
+
+BUCKET = os.environ.get("NAQFC_DATA_BUCKET", "noaa-nws-naqfc-pds")
+SOURCE_REGION = os.environ.get("NAQFC_SOURCE_REGION", "us-east-1")
+COLLECTION = os.environ.get("NAQFC_COLLECTION", "AQMv7")
+DOMAIN = os.environ.get("NAQFC_DOMAIN", "CS")
+GRID = grid_for_domain(DOMAIN, os.environ.get("NAQFC_GRID"))
+PRODUCT = os.environ.get("NAQFC_PRODUCT", "ave_1hr_o3")
+CYCLES = tuple(os.environ.get("NAQFC_CYCLES", "06,12").split(","))
 
 # The backfill extent. `initialize_backfill_store` builds the store's
 # reference_time axis from these and the inventory script defaults to them, so
-# changing them here moves both together -- which is the point. Nothing
-# downstream re-checks that the two agree.
-START = "2025-01-01"
-END = "2025-12-31"
+# changing them moves both together -- which is the point. Nothing downstream
+# re-checks that the two agree.
+START = os.environ.get("NAQFC_START", "2025-01-01")
+END = os.environ.get("NAQFC_END", "2025-12-31")
 
-# Forecast length. AQMv7 runs this product to +72 h uniformly; a cycle that
-# disagrees is rejected rather than padded (see `cycle_cube`). Changing PRODUCT
-# to ave_8hr_o3 means changing this to 65 as well.
-LEAD_HOURS = 72
+# Forecast length, which varies by product: ave_1hr_o3 runs to +72 h, ave_8hr_o3
+# to +65. A cycle that disagrees is rejected rather than padded (see
+# `cycle_cube`), so this must match the configured product.
+LEAD_HOURS = int(os.environ.get("NAQFC_LEAD_HOURS", "72"))
 
-# gribberish decodes the ozone products via NCEP local parameter (0, 14, 193).
-# The pm25 and max_* products raise inside the parser -- see the support table
-# at the end of the source notebook -- so they are rejected up front with a
-# useful message instead of an opaque parser failure inside a worker.
-VARIABLE = "ozcon"
-SUPPORTED_PRODUCTS = frozenset(
-    {"ave_1hr_o3", "ave_1hr_o3_bc", "ave_8hr_o3", "ave_8hr_o3_bc"}
-)
+# The variable name the GRIB parser assigns to the decoded field. Ozone products
+# decode to `ozcon`, pm25 to `pmtf`, so this moves with the product.
+VARIABLE = os.environ.get("NAQFC_VARIABLE", "ozcon")
 
 DIMS = ("reference_time", "lead", "y", "x")
 
@@ -73,21 +97,6 @@ DIMS = ("reference_time", "lead", "y", "x")
 # array, and Icechunk treats concurrent writes to one chunk as a merge
 # conflict regardless of whether the bytes agree.
 STATIC_COORDS = ("y", "x", "latitude", "longitude", "spatial_ref")
-
-
-class UnsupportedProductError(ValueError):
-    """Raised for a product gribberish cannot decode."""
-
-
-def check_product(product: str | None = None) -> None:
-    """Fail fast on a product the GRIB parser cannot read."""
-    product = PRODUCT if product is None else product
-    if product not in SUPPORTED_PRODUCTS:
-        raise UnsupportedProductError(
-            f"{product!r} is not decodable by gribberish; supported: "
-            f"{sorted(SUPPORTED_PRODUCTS)}. The pm25 and max_* products need "
-            f"kerchunk's scan_grib instead."
-        )
 
 
 # --- cycle enumeration -----------------------------------------------------
@@ -157,33 +166,6 @@ def cycle_urls(
         cycle_url(day, cycle, **kwargs)
         for day, cycle in cycles(start, end, cycle_hours)
     ]
-
-
-def object_key_wildcard(
-    collection: str | None = None,
-    domain: str | None = None,
-    product: str | None = None,
-    grid: str | None = None,
-) -> str:
-    """An S3-key wildcard matching exactly the files this pipeline can ingest.
-
-    Used as the SNS subscription filter so the forward queue receives only the
-    one product the store holds. The topic carries every NWS air quality
-    product -- all model versions, all domains, PM2.5 and smoke as well as
-    ozone -- so without a filter the consumer wakes for files it must discard.
-
-    The dots around the product are load-bearing: `ave_1hr_o3` is a prefix of
-    `ave_1hr_o3_bc`, so a bare `*ave_1hr_o3*` would also admit the
-    bias-corrected product, which is a different variable and does not belong
-    in this array.
-    """
-    collection = COLLECTION if collection is None else collection
-    domain = DOMAIN if domain is None else domain
-    product = PRODUCT if product is None else product
-    grid = GRID if grid is None else grid
-    # Two wildcards, within SNS's limit of three per pattern. The first spans
-    # <date>/<cycle>/aqm.t<HH>z, the second the date repeated in the filename.
-    return f"{collection}/{domain}/*.{product}.*.{grid}.grib2"
 
 
 def cycle_reference_times(
