@@ -166,24 +166,24 @@ and reduce merge conflicts the optimal approach is to
 
 ### Project commands :hammer:
 #### To set up the development environment
-```
+```bash
 ./scripts/setup.sh
 ```
 
 #### Run tests
-```
+```bash
 uv run pytest
 ```
 
 #### Review your infrastructure before deploying
-```
+```bash
 cp .env.sample .env
 uv run --env-file .env cdk synth  # after customizing .env
 ```
 
 #### Deploy the CDK infrastructure.
 
-```
+```bash
 uv run --env-file .env cdk deploy
 ```
 
@@ -195,25 +195,25 @@ in configuring and deploying their own pipeline stacks.
 
 To configure each variable/domain pipeline stack you need to 
 
-1. Edit the corresponding provided `.env` file.  Let's use the NAQFC `o3` data
+1. Edit the corresponding provided `.env` file.  Let's use the NAQFC o3/Conus data
    as an example.  Open the `.env_o3_conus` file and update the relevant
    settings.  In most cases this will be your `ACCOUNT_ID` and
    `ICECHUNK_BUCKET` (if your account has a pre-existing bucket where the
    Icechunk store will be written). 
 2. Run the following to deploy a pipeline stack specifically for the o3/Conus
    variable.
-    ```
+    ```bash
     uv run --env-file .env_o3_conus cdk deploy
     ```
 3. Create an inventory file in an accessible location for o3/Conus data.  This repo includes a helper script for doing this.  Run
-   ```
+   ```bash
     uv run scripts/generate_inventory.py \
   --domains CS --products ave_1hr_o3 \
   --start 2024-05-14 --end 2026-08-17 --verify \
   --upload s3://your-bucket/inventory/
   ```
 4. With the inventory created, you can initiate a backfill run that uses the inventory to virtualize all the referenced files. Run
-    ```
+    ```bash
     ./scripts/start_backfill.sh -e .env_o3_conus o3_conus s3://your-bucket/inventory/naqfc_aqmv7_ak_ave_1hr_o3_20240514_20260817.json
     ```
 
