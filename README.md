@@ -186,3 +186,37 @@ uv run --env-file .env cdk synth  # after customizing .env
 ```
 uv run --env-file .env cdk deploy
 ```
+
+### NAQFC-specific configuration and commands
+Because the NAQFC data required for the AQ portal covers different variables and
+grid domains.  This repo based on the virtualizarr-data-pipelines repo contains
+additional configuration settings, tools and environment files to assist users
+in configuring and deploying their own pipeline stacks.
+
+To configure each variable/domain pipeline stack you need to 
+
+1. Edit the corresponding provided `.env` file.  Let's use the NAQFC `o3` data
+   as an example.  Open the `.env_o3_conus` file and update the relevant
+   settings.  In most cases this will be your `ACCOUNT_ID` and
+   `ICECHUNK_BUCKET` (if your account has a pre-existing bucket where the
+   Icechunk store will be written). 
+2. Run the following to deploy a pipeline stack specifically for the o3/Conus
+   variable.
+    ```
+    uv run --env-file .env_o3_conus cdk deploy
+    ```
+3. Create an inventory file in an accessible location for o3/Conus data.  This repo includes a helper script for doing this.  Run
+   ```
+    uv run scripts/generate_inventory.py \
+  --domains CS --products ave_1hr_o3 \
+  --start 2024-05-14 --end 2026-08-17 --verify \
+  --upload s3://your-bucket/inventory/
+  ```
+4. With the inventory created, you can initiate a backfill run that uses the inventory to virtualize all the referenced files. Run
+    ```
+    ./scripts/start_backfill.sh -e .env_o3_conus o3_conus s3://your-bucket/inventory/naqfc_aqmv7_ak_ave_1hr_o3_20240514_20260817.json
+    ```
+
+5. Once the backfill is successfully completed, the pipeline stack can begin processing messages added to the forward processing queue. Edit `.env_o3_conus` set `AFORWARD_QUEUE_ENABLED=true` and re-deploy and your stack will now automatically process incoming messages.
+
+6. Now you can repeat the steps for each variable/domain combination so that you have 6 individual pipeline stacks / icechunk stores.
