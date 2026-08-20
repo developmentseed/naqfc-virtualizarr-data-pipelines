@@ -1,3 +1,4 @@
+import pytest
 from settings import StackSettings
 
 
@@ -7,6 +8,27 @@ def test_backfill_settings_defaults() -> None:
     assert settings.BACKFILL_PARTITION_SIZE == 500
     assert settings.BACKFILL_MAX_ITEMS_PER_BATCH == 10
     assert settings.BACKFILL_MAX_CONCURRENCY == 50
+
+
+def test_s3_prefix_scopes_the_icechunk_prefix() -> None:
+    settings = StackSettings(
+        STAGE="dev",
+        ACCOUNT_ID="111111111111",
+        S3_PREFIX="naqfc",
+        ICECHUNK_PREFIX="aqmv7/o3_conus",
+    )
+
+    assert settings.icechunk_storage_prefix == "naqfc/aqmv7/o3_conus"
+
+
+def test_icechunk_prefix_must_be_relative_to_s3_prefix() -> None:
+    with pytest.raises(ValueError, match="relative to S3_PREFIX"):
+        StackSettings(
+            STAGE="dev",
+            ACCOUNT_ID="111111111111",
+            S3_PREFIX="naqfc",
+            ICECHUNK_PREFIX="naqfc/aqmv7/o3_conus",
+        )
 
 
 def test_forward_queue_enabled_defaults_on_when_backfill_off() -> None:

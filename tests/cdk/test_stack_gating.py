@@ -1,10 +1,15 @@
 import aws_cdk as cdk
-from aws_cdk.assertions import Template
+from aws_cdk.assertions import Match, Template
 from settings import StackSettings
 from stack import VirtualizarrSqsStack
 
 
-def _template(*, backfill: bool, forward: bool | None = None) -> Template:
+def _template(
+    *,
+    backfill: bool,
+    forward: bool | None = None,
+    icechunk_bucket: str | None = None,
+) -> Template:
     kwargs = dict(
         STAGE="dev",
         ACCOUNT_ID="111111111111",
@@ -14,6 +19,8 @@ def _template(*, backfill: bool, forward: bool | None = None) -> Template:
     )
     if forward is not None:
         kwargs["FORWARD_QUEUE_ENABLED"] = forward
+    if icechunk_bucket is not None:
+        kwargs["ICECHUNK_BUCKET"] = icechunk_bucket
     settings = StackSettings(**kwargs)
     app = cdk.App()
     stack = VirtualizarrSqsStack(
@@ -34,7 +41,78 @@ def test_backfill_disabled_creates_no_state_machine() -> None:
 
 
 def test_backfill_enabled_creates_state_machine() -> None:
-    _synth(True).resource_count_is("AWS::StepFunctions::StateMachine", 1)
+    template = _synth(True)
+    template.resource_count_is("AWS::StepFunctions::StateMachine", 1)
+    template.resource_count_is("AWS::CloudFormation::CustomResource", 0)
+
+
+def test_existing_icechunk_bucket_must_match_stack_region() -> None:
+    template = _template(backfill=True, icechunk_bucket="existing-bucket")
+
+    template.has_resource_properties(
+        "AWS::CloudFormation::CustomResource",
+        Match.object_like(
+            {
+                "BucketName": "existing-bucket",
+                "ExpectedRegion": "us-east-1",
+            }
+        ),
+    )
+    template.has_resource_properties(
+        "AWS::Lambda::Function",
+        Match.object_like({"Timeout": 30}),
+    )
+    template.has_resource_properties(
+        "AWS::IAM::Policy",
+        Match.object_like(
+            {
+                "PolicyDocument": {
+                    "Statement": Match.array_with(
+                        [
+                            Match.object_like(
+                                {
+                                    "Action": "s3:GetBucketLocation",
+                                    "Resource": Match.any_value(),
+                                }
+                            )
+                        ]
+                    )
+                }
+            }
+        ),
+    )
+
+
+def test_s3_prefix_scopes_the_icechunk_store() -> None:
+    settings = StackSettings(
+        STAGE="dev",
+        ACCOUNT_ID="111111111111",
+        ICECHUNK_BUCKET_NAME="ice-test",
+        DATA_BUCKET_NAME="data-test",
+        S3_PREFIX="naqfc",
+        ICECHUNK_PREFIX="aqmv7/o3_conus",
+    )
+    app = cdk.App()
+    stack = VirtualizarrSqsStack(
+        app,
+        settings.STACK_NAME,
+        settings=settings,
+        env={"account": settings.ACCOUNT_ID, "region": settings.ACCOUNT_REGION},
+    )
+
+    Template.from_stack(stack).has_resource_properties(
+        "AWS::Lambda::Function",
+        Match.object_like(
+            {
+                "Environment": {
+                    "Variables": {
+                        "ICECHUNK_PREFIX": "naqfc/aqmv7/o3_conus",
+                        "ICECHUNK_REGION": "us-east-1",
+                    }
+                }
+            }
+        ),
+    )
 
 
 def test_forward_queue_enabled_when_backfill_off() -> None:

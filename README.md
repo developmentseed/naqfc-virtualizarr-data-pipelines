@@ -48,7 +48,7 @@ Virtualizarr Data Pipelines uses a strongly-typed [settings module](./cdk/settin
 
 Backfill processes a large set of existing files in a single, highly
 parallel run. Instead of appending each file to `main`, where many concurrent workers
-would contend for the branch tip. It declares the store at its **full shape** up front on a dedicated `backfill` branch and then uses Icechunk's **fork and merge** model.  
+would contend for the branch tip. It declares the store at its **full shape** up front on a dedicated `backfill` branch and then uses Icechunk's **fork and merge** model.
 
 1. The coordinator creates an Icechunk store with the dataset's full dimension extent for the files included in the input file inventory.
 2. A coordinator splits the file inventory into partitions.  Each
@@ -56,13 +56,13 @@ would contend for the branch tip. It declares the store at its **full shape** up
    store as a single commit.  You'll want to balance your partitioning size so you're
    making a reasonably small number of commits but not losing too much work if
    one of the jobs in your partition fails (which means all the files in that
-   partition will not be committed). 
-3. For the first partition, the coordinator forks a clean, committed base snapshot.  
+   partition will not be committed).
+3. For the first partition, the coordinator forks a clean, committed base snapshot.
 4. For the partition the coordinator spawns a number of Lambda workers.  Each worker copies the fork and writes its set of files to a **disjoint** region of the array via
 `vds.vz.to_icechunk(fork.store, region="auto")` without committing.
 Region distjointness is the operator's responsibility, trying to write to the same region will result in merge failures.
 5. After it has written it's files to the fork the worker copies the pickled
-   fork to S3. 
+   fork to S3.
 6. When all the partition workers have completed, a reducer function merges all the pickled forks into **one commit for the partition** and finally `main` is fast-forwarded to the backfill tip. Because every worker writes to an independent fork and only the reducer commits, there is no tip contention and the writes-per-commit ratio is maximized.
 7. Each partition is processed serially so after the first partition is
    committed a new fork is created and used by the next partition.
@@ -94,7 +94,10 @@ Backfill is configured through the same [settings module](./cdk/settings.py) / `
   partition becomes one merged commit.
 - **BACKFILL_MAX_ITEMS_PER_BATCH** (default `10`) — number of file keys processed by each worker Lambda (the inner Distributed Map's batch size). Each batch becomes one child fork.  Keep Lambda timeout limits in mind when configuring this.
 - **BACKFILL_MAX_CONCURRENCY** (default `50`) — maximum number of worker Lambdas running in parallel within a partition.  Note that if you are using dependent rate limited APIs like NASA EDL use appropriate settings here to avoid service throttling.
-- **ICECHUNK_BUCKET_NAME** - the name for the S3 bucket to create holding the Icechunk store and the per-run fork artifacts.
+- **ICECHUNK_BUCKET** - optional existing bucket for the Icechunk store and per-run fork artifacts. It must be in the stack's region; deployment checks its actual region and fails otherwise.
+- **ICECHUNK_BUCKET_NAME** - name for the bucket to create when `ICECHUNK_BUCKET` is unset.
+- **S3_PREFIX** - optional common key prefix for all pipeline output. Backfill manifests and fork artifacts are written to `<S3_PREFIX>/backfill/<execution-name>/`.
+- **ICECHUNK_PREFIX** - dataset-specific Icechunk key prefix, relative to `S3_PREFIX`. For example, `S3_PREFIX=naqfc` with `ICECHUNK_PREFIX=aqmv7/o3_conus` creates the store at `naqfc/aqmv7/o3_conus`.
 - **DATA_BUCKET_NAME** - the source bucket workers read files from.
 
 #### Running Backfill Processing
@@ -138,7 +141,10 @@ The `processor` protocol methods below drive **forward processing**:
   processing modes and is invoked on the schedule set by `GARBAGE_COLLECTION_FREQUENCY`.
 
 #### Forward Processing Configuration
-- **ICECHUNK_BUCKET_NAME** - the name for the S3 bucket to create holding the Icechunk store and the per-run fork artifacts.
+- **ICECHUNK_BUCKET** - optional existing bucket for the Icechunk store. It must be in the stack's region; deployment checks its actual region and fails otherwise.
+- **ICECHUNK_BUCKET_NAME** - name for the bucket to create when `ICECHUNK_BUCKET` is unset.
+- **S3_PREFIX** - optional common key prefix for all pipeline output.
+- **ICECHUNK_PREFIX** - dataset-specific Icechunk key prefix, relative to `S3_PREFIX`.
 - **DATA_BUCKET_NAME** - the source bucket workers read files from.
 - **SNS_TOPIC** - the SNS topic ARN for the data bucket to subscribe to
   notifications for newly published files.
@@ -193,13 +199,13 @@ grid domains.  This repo based on the virtualizarr-data-pipelines repo contains
 additional configuration settings, tools and environment files to assist users
 in configuring and deploying their own pipeline stacks.
 
-To configure each variable/domain pipeline stack you need to 
+To configure each variable/domain pipeline stack you need to
 
 1. Edit the corresponding provided `.env` file.  Let's use the NAQFC o3/Conus data
    as an example.  Open the `.env_o3_conus` file and update the relevant
-   settings.  In most cases this will be your `ACCOUNT_ID` and
-   `ICECHUNK_BUCKET` (if your account has a pre-existing bucket where the
-   Icechunk store will be written). 
+   settings. In most cases this will be your `ACCOUNT_ID` and
+   `ICECHUNK_BUCKET` (if your account has a pre-existing bucket in the stack's
+   region where the Icechunk store will be written).
 2. Run the following to deploy a pipeline stack specifically for the o3/Conus
    variable.
     ```bash
@@ -209,15 +215,89 @@ To configure each variable/domain pipeline stack you need to
     ```bash
     uv run scripts/generate_inventory.py \
       --domains CS --products ave_1hr_o3 \
-      --start 2024-05-14 --end 2026-08-17 --verify \
-      --upload s3://your-bucket/inventory/
+      --start 2024-05-14 --end 2026-08-20 --verify \
+      --upload s3://airquality-data-store-develop/naqfc/inventory/
     ```
 4. With the inventory created, you can initiate a backfill run that uses the inventory to virtualize all the referenced files. Run
     ```bash
-    ./scripts/start_backfill.sh -e .env_o3_conus o3-conus-20260817 \
-      s3://your-bucket/inventory/naqfc_aqmv7_cs_ave_1hr_o3_20240514_20260817.json
+    ./scripts/start_backfill.sh -e .env_o3_conus o3-conus-20260820-2 \
+      s3://airquality-data-store-develop/naqfc/inventory/naqfc_aqmv7_cs_ave_1hr_o3_20240514_20260820.json
     ```
 
 5. Once the backfill is successfully completed, the pipeline stack can begin processing messages added to the forward processing queue. Edit `.env_o3_conus` set `FORWARD_QUEUE_ENABLED=true` and re-deploy and your stack will now automatically process incoming messages.
 
 6. Now you can repeat the steps for each variable/domain combination so that you have 6 individual pipeline stacks / icechunk stores.
+
+### Deploy and backfill all NAQFC stacks
+
+The commands below use the same account, bucket, prefix, and date range as the
+o3/CONUS walkthrough. Each stack has a separate Icechunk prefix and inventory.
+Deploy all six stacks before starting their backfills:
+
+```bash
+uv run --env-file .env_o3_conus cdk deploy  # done
+uv run --env-file .env_o3_ak cdk deploy  # done
+uv run --env-file .env_o3_hi cdk deploy  # done
+uv run --env-file .env_pm25_conus cdk deploy
+uv run --env-file .env_pm25_ak cdk deploy
+uv run --env-file .env_pm25_hi cdk deploy
+```
+
+Generate and upload one verified inventory for each domain/product pair:
+
+```bash
+uv run scripts/generate_inventory.py \
+  --domains CS --products ave_1hr_o3 \
+  --start 2024-05-14 --end 2026-08-20 --verify \
+  --upload s3://airquality-data-store-develop/naqfc/inventory/  # done
+
+uv run scripts/generate_inventory.py \
+  --domains AK --products ave_1hr_o3 \
+  --start 2024-05-14 --end 2026-08-20 --verify \
+  --upload s3://airquality-data-store-develop/naqfc/inventory/  # done
+
+uv run scripts/generate_inventory.py \
+  --domains HI --products ave_1hr_o3 \
+  --start 2024-05-14 --end 2026-08-20 --verify \
+  --upload s3://airquality-data-store-develop/naqfc/inventory/  # done
+
+uv run scripts/generate_inventory.py \
+  --domains CS --products ave_1hr_pm25 \
+  --start 2024-05-14 --end 2026-08-20 --verify \
+  --upload s3://airquality-data-store-develop/naqfc/inventory/
+
+uv run scripts/generate_inventory.py \
+  --domains AK --products ave_1hr_pm25 \
+  --start 2024-05-14 --end 2026-08-20 --verify \
+  --upload s3://airquality-data-store-develop/naqfc/inventory/
+
+uv run scripts/generate_inventory.py \
+  --domains HI --products ave_1hr_pm25 \
+  --start 2024-05-14 --end 2026-08-20 --verify \
+  --upload s3://airquality-data-store-develop/naqfc/inventory/
+```
+
+Start one backfill execution per stack after its inventory has uploaded:
+
+```bash
+./scripts/start_backfill.sh -e .env_o3_conus o3-conus-20260820-2 \
+  s3://airquality-data-store-develop/naqfc/inventory/naqfc_aqmv7_cs_ave_1hr_o3_20240514_20260820.json  # done
+
+./scripts/start_backfill.sh -e .env_o3_ak o3-ak-20260820 \
+  s3://airquality-data-store-develop/naqfc/inventory/naqfc_aqmv7_ak_ave_1hr_o3_20240514_20260820.json  # done
+
+./scripts/start_backfill.sh -e .env_o3_hi o3-hi-20260820 \
+  s3://airquality-data-store-develop/naqfc/inventory/naqfc_aqmv7_hi_ave_1hr_o3_20240514_20260820.json  # done
+
+./scripts/start_backfill.sh -e .env_pm25_conus pm25-conus-20260820 \
+  s3://airquality-data-store-develop/naqfc/inventory/naqfc_aqmv7_cs_ave_1hr_pm25_20240514_20260820.json
+
+./scripts/start_backfill.sh -e .env_pm25_ak pm25-ak-20260820 \
+  s3://airquality-data-store-develop/naqfc/inventory/naqfc_aqmv7_ak_ave_1hr_pm25_20240514_20260820.json
+
+./scripts/start_backfill.sh -e .env_pm25_hi pm25-hi-20260820 \
+  s3://airquality-data-store-develop/naqfc/inventory/naqfc_aqmv7_hi_ave_1hr_pm25_20240514_20260820.json
+```
+
+After each execution succeeds, enable forward processing and redeploy that stack
+as described in the walkthrough above.

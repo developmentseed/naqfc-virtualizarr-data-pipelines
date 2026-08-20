@@ -1,3 +1,4 @@
+import textwrap
 from typing import Any
 
 from aws_cdk import (
@@ -78,11 +79,68 @@ class VirtualizarrSqsStack(Stack):
                 queue=self.dlq,
             ),
         )
+        self.icechunk_bucket_region_validator: CustomResource | None = None
         if settings.ICECHUNK_BUCKET:
             self.icechunk_bucket = s3.Bucket.from_bucket_name(
                 self,
                 f"{settings.STACK_NAME}-bucket",
                 bucket_name=settings.ICECHUNK_BUCKET,
+            )
+            validator = _lambda.Function(
+                self,
+                "ValidateIcechunkBucketRegionFunction",
+                runtime=_lambda.Runtime.PYTHON_3_12,
+                handler="index.handler",
+                timeout=Duration.seconds(30),
+                code=_lambda.Code.from_inline(
+                    textwrap.dedent(
+                        """\
+                        import boto3
+
+
+                        def handler(event, _context):
+                            if event["RequestType"] == "Delete":
+                                return {
+                                    "PhysicalResourceId": event["PhysicalResourceId"]
+                                }
+
+                            bucket = event["ResourceProperties"]["BucketName"]
+                            expected = event["ResourceProperties"]["ExpectedRegion"]
+                            location = boto3.client("s3").get_bucket_location(
+                                Bucket=bucket
+                            )["LocationConstraint"]
+                            actual = {None: "us-east-1", "EU": "eu-west-1"}.get(
+                                location, location
+                            )
+                            if actual != expected:
+                                raise ValueError(
+                                    f"Icechunk bucket {bucket!r} is in {actual!r}; "
+                                    f"expected {expected!r}"
+                                )
+                            return {"PhysicalResourceId": f"{bucket}:{actual}"}
+                        """
+                    )
+                ),
+            )
+            validator.add_to_role_policy(
+                iam.PolicyStatement(
+                    actions=["s3:GetBucketLocation"],
+                    resources=[self.icechunk_bucket.bucket_arn],
+                )
+            )
+            provider = cr.Provider(
+                self,
+                "ValidateIcechunkBucketRegionProvider",
+                on_event_handler=validator,
+            )
+            self.icechunk_bucket_region_validator = CustomResource(
+                self,
+                "ValidateIcechunkBucketRegion",
+                service_token=provider.service_token,
+                properties={
+                    "BucketName": self.icechunk_bucket.bucket_name,
+                    "ExpectedRegion": settings.ACCOUNT_REGION,
+                },
             )
         else:
             self.icechunk_bucket = s3.Bucket(
@@ -106,8 +164,8 @@ class VirtualizarrSqsStack(Stack):
             "ICECHUNK_BUCKET": self.icechunk_bucket.bucket_name,
             "ICECHUNK_REGION": settings.ACCOUNT_REGION,
         }
-        if settings.ICECHUNK_PREFIX:
-            self.processor_env["ICECHUNK_PREFIX"] = settings.ICECHUNK_PREFIX
+        if settings.icechunk_storage_prefix:
+            self.processor_env["ICECHUNK_PREFIX"] = settings.icechunk_storage_prefix
         if settings.EARTHDATA_SECRET_ARN:
             self.processor_env["EARTHDATA_SECRET_ARN"] = settings.EARTHDATA_SECRET_ARN
 
@@ -339,7 +397,8 @@ class VirtualizarrSqsStack(Stack):
                 self,
                 "BackfillPipeline",
                 icechunk_bucket=self.icechunk_bucket,
-                icechunk_prefix=settings.ICECHUNK_PREFIX,
+                icechunk_prefix=settings.icechunk_storage_prefix,
+                s3_prefix=settings.s3_key_prefix,
                 data_bucket_name=settings.DATA_BUCKET_NAME,
                 partition_size=settings.BACKFILL_PARTITION_SIZE,
                 max_items_per_batch=settings.BACKFILL_MAX_ITEMS_PER_BATCH,
