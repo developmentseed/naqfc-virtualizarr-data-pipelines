@@ -1,6 +1,7 @@
 import aws_cdk as cdk
 import aws_cdk.aws_s3 as s3
 from aws_cdk.assertions import Match, Template
+from conftest import actions_of, iam_statements, resources_of
 from stack_constructs.backfill_pipeline import BackfillPipeline
 
 
@@ -113,3 +114,68 @@ def test_state_machine_shape() -> None:
     # run_prefix is scoped under the configured global output prefix.
     assert "naqfc/backfill" in asl
     assert "Execution.Name" in asl
+
+
+STORE = "arn:<REF>:s3:::ice-test/naqfc/aqmv7/o3_conus/*"
+RUN = "arn:<REF>:s3:::ice-test/naqfc/backfill/*"
+INVENTORY = "arn:<REF>:s3:::ice-test/naqfc/inventory/*"
+
+
+def _scoped_template() -> Template:
+    app = cdk.App()
+    stack = cdk.Stack(
+        app,
+        "TestStack",
+        env=cdk.Environment(account="111111111111", region="us-east-1"),
+    )
+    bucket = s3.Bucket.from_bucket_name(stack, "IceBucket", "ice-test")
+    BackfillPipeline(
+        stack,
+        "Backfill",
+        icechunk_bucket=bucket,
+        icechunk_prefix="naqfc/aqmv7/o3_conus",
+        s3_prefix="naqfc",
+        inventory_prefix="naqfc/inventory",
+        data_bucket_name="my-data-bucket",
+        partition_size=500,
+        max_items_per_batch=10,
+        max_concurrency=50,
+    )
+    return Template.from_stack(stack)
+
+
+def test_partition_reads_inventory_and_writes_run_prefix_only() -> None:
+    stmts = list(iam_statements(_scoped_template(), "partitionfn"))
+    all_resources = [r for s in stmts for r in resources_of(s)]
+    assert INVENTORY in all_resources
+    assert STORE not in all_resources
+    writes = [s for s in stmts if "s3:PutObject" in actions_of(s)]
+    assert writes and all(resources_of(s) == [RUN] for s in writes)
+
+
+def test_repo_lambdas_scoped_to_store_and_run_prefixes() -> None:
+    template = _scoped_template()
+    for action in ["init", "fork", "worker", "reduce", "promote"]:
+        stmts = list(iam_statements(template, f"{action}fn"))
+        writes = [s for s in stmts if "s3:PutObject" in actions_of(s)]
+        assert writes, action
+        assert all(resources_of(s) == [STORE, RUN] for s in writes), action
+        assert any(
+            "s3:ListBucket" in actions_of(s)
+            and s.get("Condition")
+            == {
+                "StringLike": {
+                    "s3:prefix": ["naqfc/aqmv7/o3_conus/*", "naqfc/backfill/*"]
+                }
+            }
+            for s in stmts
+        ), action
+
+
+def test_no_icechunk_prefix_keeps_bucket_wide_grant() -> None:
+    stmts = list(iam_statements(_template(), "initfn"))
+    assert any(
+        "s3:DeleteObject*" in actions_of(s)
+        and any(isinstance(r, str) and r.endswith("/*") for r in resources_of(s))
+        for s in stmts
+    )
