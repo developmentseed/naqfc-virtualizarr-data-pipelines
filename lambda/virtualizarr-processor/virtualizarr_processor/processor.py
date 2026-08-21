@@ -20,12 +20,16 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import icechunk
 from icechunk import ForkSession, Repository, Session
 
 from virtualizarr_processor import naqfc
+
+if TYPE_CHECKING:
+    import numpy as np
+    import xarray as xr
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +40,64 @@ def source_prefix() -> str:
     """URL prefix of the bucket holding the virtual chunks. Resolved per call so
     it tracks `naqfc.BUCKET` rather than freezing it at import."""
     return f"s3://{naqfc.BUCKET}/"
+
+
+class WritePlan(NamedTuple):
+    """How one cycle gets written: `plan.cube.vz.to_icechunk(store, **plan.kwargs)`."""
+
+    mode: str  # "create" | "region" | "append"
+    cube: "xr.Dataset"
+    kwargs: dict[str, Any]
+
+
+def store_reference_times(store: Any) -> "np.ndarray | None":
+    """The `reference_time` axis a store already holds, or None if it holds no
+    data yet.
+
+    Re-read for every file rather than cached: an append earlier in the same
+    batch adds a row that the next file has to see. A session reads its own
+    uncommitted writes, so this stays correct mid-batch.
+    """
+    import xarray as xr
+
+    try:
+        cube = xr.open_zarr(store, consolidated=False, zarr_format=3)
+    except Exception:
+        # No group at all yet: a forward-only deployment before its first file.
+        return None
+    if naqfc.VARIABLE not in cube.variables or "reference_time" not in cube.coords:
+        return None
+    return cast("np.ndarray", cube["reference_time"].values)
+
+
+def write_plan(cube: "xr.Dataset", existing: "np.ndarray | None") -> WritePlan:
+    """Choose between creating, region-writing, and appending one cycle.
+
+    The deciding question is whether the store's `reference_time` axis already
+    carries this cycle:
+
+    * **region** -- it does, so the row exists and must be written in place.
+      An append would add a second row with the same coordinate value, leaving
+      the axis non-monotonic and the cycle stored twice. This is the normal case
+      after a backfill: the store is declared at its full extent up front, so
+      every cycle inside that extent already has a (possibly empty) row waiting,
+      and it is also how a re-delivered notification lands harmlessly.
+    * **append** -- it does not, which is the forward case: a cycle past the
+      declared axis extends it by one row.
+    * **create** -- there is no array at all yet, the first file of a
+      forward-only deployment, where the write has to create the store.
+
+    A region write goes through `naqfc.region_cube`, which drops the grid
+    coordinates: they carry no `reference_time` dimension, so `region="auto"`
+    has no slice to resolve for them. An append keeps them, where having no
+    `reference_time` dimension means the already-written copies are left alone.
+    """
+    if existing is None:
+        return WritePlan("create", cube, {})
+    reference_time = cube["reference_time"].values[0]
+    if bool((existing == reference_time).any()):
+        return WritePlan("region", naqfc.region_cube(cube), {"region": "auto"})
+    return WritePlan("append", cube, {"append_dim": "reference_time"})
 
 
 class Processor:
@@ -143,38 +205,25 @@ class Processor:
     def initialize_session(self, repo: Repository) -> Session:
         return repo.writable_session("main")
 
-    def _has_data(self, session: Session) -> bool:
-        """Whether the store already holds the data array."""
-        import zarr
-
-        try:
-            return naqfc.VARIABLE in zarr.open_group(session.store, mode="r")
-        except Exception:
-            # No group at all yet: a forward-only deployment before its first file.
-            return False
-
     def process_file(self, file_key: str, session: Session) -> bool:
-        """Add one cycle to `main` as a `reference_time` row.
+        """Write one cycle into `main`, region-writing or appending as needed.
 
-        Appends, except for the very first cycle of a forward-only deployment,
-        where there is no array to append to yet and the write has to create it.
-        After a backfill the store already exists, so this always appends.
-
-        Unlike the backfill path this keeps the grid coordinates on the cube:
-        they carry no `reference_time` dimension, so an append leaves the
-        already-written copies alone rather than duplicating them.
+        Which of the two depends on the file: a cycle whose `reference_time` is
+        already on the store's axis is written in place, one that is not extends
+        the axis by a row. `write_plan` holds the reasoning.
         """
         try:
             cube = naqfc.cycle_cube(file_key)
-            append = {"append_dim": "reference_time"} if self._has_data(session) else {}
-            cube.vz.to_icechunk(session.store, **append)  # type: ignore[arg-type]
+            plan = write_plan(cube, store_reference_times(session.store))
+            logger.info("%s: %s write to main", file_key, plan.mode)
+            plan.cube.vz.to_icechunk(session.store, **plan.kwargs)
             return True
         except Exception:
             logger.exception("process_file failed for %s", file_key)
             return False
 
     def commit_processed_files(self, session: Session) -> str:
-        return str(session.commit(message=f"Append to {session.snapshot_id}"))
+        return str(session.commit(message=f"Update {session.snapshot_id}"))
 
     # --- maintenance --------------------------------------------------------
 
