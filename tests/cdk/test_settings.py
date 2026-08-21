@@ -60,3 +60,18 @@ def test_forward_queue_disabled_explicit_with_backfill_off() -> None:
         FORWARD_QUEUE_ENABLED=False,
     )
     assert settings.FORWARD_QUEUE_ENABLED is False
+
+
+def test_inventory_prefix_defaults_under_s3_prefix() -> None:
+    s = StackSettings(STAGE="dev", S3_PREFIX="naqfc", INVENTORY_PREFIX=None)
+    assert s.inventory_prefix == "naqfc/inventory"
+
+
+def test_inventory_prefix_without_s3_prefix() -> None:
+    s = StackSettings(STAGE="dev", S3_PREFIX=None, INVENTORY_PREFIX=None)
+    assert s.inventory_prefix == "inventory"
+
+
+def test_inventory_prefix_explicit_overrides_and_strips() -> None:
+    s = StackSettings(STAGE="dev", S3_PREFIX="naqfc", INVENTORY_PREFIX="/custom/inv/")
+    assert s.inventory_prefix == "custom/inv"

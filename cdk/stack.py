@@ -47,7 +47,12 @@ from aws_cdk import (
 from aws_cdk import custom_resources as cr
 from constructs import Construct
 from settings import StackSettings  # type: ignore[import-not-found]
-from stack_constructs import BackfillPipeline, BatchInfra, BatchJob
+from stack_constructs import (
+    BackfillPipeline,
+    BatchInfra,
+    BatchJob,
+    grant_prefixed_read_write,
+)
 
 
 class VirtualizarrSqsStack(Stack):
@@ -153,8 +158,8 @@ class VirtualizarrSqsStack(Stack):
             self,
             "IcechunkBucketName",
             value=self.icechunk_bucket.bucket_name,
-            description="Icechunk store bucket. Upload the backfill inventory here "
-            "(the partition Lambda has read access to this bucket).",
+            description="Icechunk bucket for backfill inventory under INVENTORY_PREFIX "
+            "(default {S3_PREFIX}/inventory/). Partition Lambda has read-only access.",
         )
 
         # Shared processor env: resolved by virtualizarr_processor at runtime to
@@ -264,7 +269,11 @@ class VirtualizarrSqsStack(Stack):
             )
         )
 
-        self.icechunk_bucket.grant_read_write(self.process_messages_lambda)
+        grant_prefixed_read_write(
+            self.process_messages_lambda,
+            self.icechunk_bucket,
+            [settings.icechunk_storage_prefix],
+        )
 
         self.process_messages_lambda.add_event_source(
             lambda_event_sources.SqsEventSource(
@@ -294,7 +303,11 @@ class VirtualizarrSqsStack(Stack):
                 environment=dict(self.processor_env),
             )
 
-            self.icechunk_bucket.grant_read_write(self.initialize_icechunk_lambda)
+            grant_prefixed_read_write(
+                self.initialize_icechunk_lambda,
+                self.icechunk_bucket,
+                [settings.icechunk_storage_prefix],
+            )
             if self.earthdata_secret is not None:
                 self.earthdata_secret.grant_read(self.initialize_icechunk_lambda)
 
@@ -370,7 +383,11 @@ class VirtualizarrSqsStack(Stack):
                 retry_attempts=1,
                 environment=dict(self.processor_env),
             )
-            self.icechunk_bucket.grant_read_write(self.gc_job.role)
+            grant_prefixed_read_write(
+                self.gc_job.role,
+                self.icechunk_bucket,
+                [settings.icechunk_storage_prefix],
+            )
             if self.earthdata_secret is not None:
                 self.earthdata_secret.grant_read(self.gc_job.role)
 
@@ -398,6 +415,7 @@ class VirtualizarrSqsStack(Stack):
                 "BackfillPipeline",
                 icechunk_bucket=self.icechunk_bucket,
                 icechunk_prefix=settings.icechunk_storage_prefix,
+                inventory_prefix=settings.inventory_prefix,
                 s3_prefix=settings.s3_key_prefix,
                 data_bucket_name=settings.DATA_BUCKET_NAME,
                 partition_size=settings.BACKFILL_PARTITION_SIZE,
