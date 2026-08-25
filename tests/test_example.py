@@ -12,9 +12,14 @@ from datetime import datetime, timedelta, timezone
 import icechunk
 import numpy as np
 import pytest
+import xarray as xr
 from icechunk import Repository
 from virtualizarr_processor import naqfc
-from virtualizarr_processor.processor import Processor
+from virtualizarr_processor.processor import (
+    Processor,
+    store_reference_times,
+    write_plan,
+)
 from virtualizarr_processor.typing import VirtualizarrProcessor
 
 
@@ -187,3 +192,227 @@ def test_truncated_cycle_is_rejected() -> None:
 
     with pytest.raises(ValueError, match="lead steps, expected"):
         naqfc.cycle_cube(url, lead_hours=99)
+
+
+# --- forward write mode ----------------------------------------------------
+
+
+def synthetic_cube(reference_time: str) -> xr.Dataset:
+    """A cycle cube's shape without the GRIB: same dims, coords and variable
+    name as `naqfc.cycle_cube`, so the write-mode rules can be checked offline."""
+    lead = np.arange(1, 4, dtype="int32")
+    return xr.Dataset(
+        {naqfc.VARIABLE: (naqfc.DIMS, np.zeros((1, len(lead), 2, 2), dtype="float32"))},
+        coords={
+            "reference_time": (
+                "reference_time",
+                np.array([reference_time], dtype="datetime64[ns]"),
+            ),
+            "lead": ("lead", lead),
+            "y": ("y", np.arange(2)),
+            "x": ("x", np.arange(2)),
+        },
+    )
+
+
+def test_write_plan_creates_when_the_store_is_empty() -> None:
+    """The first file of a forward-only deployment has no array to write into,
+    so the write has to create one."""
+    plan = write_plan(synthetic_cube("2025-01-01T06:00:00"), None)
+
+    assert plan.mode == "create"
+    assert plan.kwargs == {}
+
+
+def test_write_plan_appends_a_cycle_off_the_end_of_the_axis() -> None:
+    existing = np.array(["2025-01-01T06:00:00"], dtype="datetime64[ns]")
+
+    plan = write_plan(synthetic_cube("2025-01-01T12:00:00"), existing)
+
+    assert plan.mode == "append"
+    assert plan.kwargs == {"append_dim": "reference_time"}
+    # the grid coordinates ride along: with no reference_time dimension they
+    # leave the already-written copies alone rather than duplicating them
+    assert "y" in plan.cube.coords
+
+
+def test_write_plan_regions_a_cycle_already_on_the_axis() -> None:
+    """Appending a reference_time the store already carries would store the
+    cycle twice and leave the axis non-monotonic, so it is written in place."""
+    existing = np.array(
+        ["2025-01-01T06:00:00", "2025-01-01T12:00:00"], dtype="datetime64[ns]"
+    )
+
+    plan = write_plan(synthetic_cube("2025-01-01T12:00:00"), existing)
+
+    assert plan.mode == "region"
+    assert plan.kwargs == {"region": "auto"}
+    # region="auto" resolves a slice per dimension, so variables that have none
+    # of the region's dimensions cannot come along
+    for dropped in naqfc.STATIC_COORDS:
+        assert dropped not in plan.cube.variables
+    assert "reference_time" in plan.cube.coords and "lead" in plan.cube.coords
+
+
+def test_write_plan_matches_across_datetime_resolutions() -> None:
+    """A store's axis decodes at whatever resolution its units imply, which need
+    not be the cube's nanoseconds; the cycle is still the same cycle."""
+    existing = np.array(["2025-01-01T06:00:00"], dtype="datetime64[s]")
+
+    assert write_plan(synthetic_cube("2025-01-01T06:00:00"), existing).mode == "region"
+    assert write_plan(synthetic_cube("2025-01-02T06:00:00"), existing).mode == "append"
+
+
+@pytest.mark.network
+def test_reprocessing_a_cycle_rewrites_its_row(naqfc_repo: Repository) -> None:
+    """End to end over three writes: create, re-deliver the same cycle, then a
+    new one. The re-delivery must leave one row, not two."""
+    processor = Processor()
+    session = processor.initialize_session(naqfc_repo)
+    first, second = naqfc.cycle_urls("2025-01-01", "2025-01-01", ("06", "12"))
+
+    assert processor.process_file(first, session)  # create
+    assert processor.process_file(first, session)  # same cycle -> region write
+    assert processor.process_file(second, session)  # new cycle -> append
+
+    cube = xr.open_zarr(session.store, consolidated=False, zarr_format=3)
+    assert cube.sizes["reference_time"] == 2
+    assert list(cube.reference_time.values) == [
+        np.datetime64("2025-01-01T06:00:00", "ns"),
+        np.datetime64("2025-01-01T12:00:00", "ns"),
+    ]
+
+
+# --- forward write modes against a real store ------------------------------
+
+
+@pytest.fixture
+def local_repo(tmp_path: pathlib.Path) -> Repository:
+    """A repo whose virtual chunks are local files.
+
+    The processor's own repo points its virtual chunk container at NOAA's
+    bucket, so writing anything into it needs real GRIB. This one stands in for
+    it, letting the whole create/region/append cycle run offline.
+    """
+    chunks = tmp_path / "chunks"
+    chunks.mkdir()
+    prefix = f"file://{chunks}/"
+    config = icechunk.RepositoryConfig.default()
+    config.set_virtual_chunk_container(
+        icechunk.VirtualChunkContainer(prefix, icechunk.local_filesystem_store(chunks))
+    )
+    return icechunk.Repository.open_or_create(
+        storage=icechunk.local_filesystem_storage(str(tmp_path / "repo")),
+        config=config,
+        authorize_virtual_chunk_access={
+            prefix: icechunk.credentials.LocalFileSystemAccess
+        },
+    )
+
+
+def virtual_cycle_cube(
+    chunks: pathlib.Path, reference_time: str, value: float, n_lead: int = 3
+) -> xr.Dataset:
+    """What `naqfc.cycle_cube` produces, with local bytes standing in for GRIB.
+
+    Same dims, coords, encoding and one-message-per-chunk grid; only the chunks
+    point at a local file instead of a range inside a NAQFC object.
+    """
+    from virtualizarr.manifests import ChunkManifest, ManifestArray
+    from zarr.codecs import BytesCodec
+    from zarr.core.dtype import parse_data_type
+    from zarr.core.metadata import ArrayV3Metadata
+
+    ny = nx = 2
+    data = np.full((n_lead, ny, nx), value, dtype="float32")
+    chunk_bytes = data[0].nbytes
+    path = chunks / f"{reference_time.replace(':', '')}.bin"
+    path.write_bytes(data.tobytes())
+
+    dtype = parse_data_type(data.dtype, zarr_format=3)
+    array = ManifestArray(
+        chunkmanifest=ChunkManifest(
+            {
+                f"0.{lead}.0.0": {
+                    "path": f"file://{path}",
+                    "offset": lead * chunk_bytes,
+                    "length": chunk_bytes,
+                }
+                for lead in range(n_lead)
+            }
+        ),
+        metadata=ArrayV3Metadata(
+            shape=(1, n_lead, ny, nx),
+            data_type=dtype,
+            chunk_grid={
+                "name": "regular",
+                "configuration": {"chunk_shape": (1, 1, ny, nx)},
+            },
+            chunk_key_encoding={"name": "default"},
+            fill_value=dtype.default_scalar(),
+            codecs=[BytesCodec()],
+            attributes={},
+            dimension_names=naqfc.DIMS,
+            storage_transformers=None,
+        ),
+    )
+    cube = xr.Dataset(
+        {naqfc.VARIABLE: xr.Variable(naqfc.DIMS, array)},
+        coords={
+            "reference_time": (
+                "reference_time",
+                np.array([reference_time], dtype="datetime64[ns]"),
+            ),
+            "lead": ("lead", np.arange(1, n_lead + 1, dtype="int32")),
+            "y": ("y", np.arange(ny)),
+            "x": ("x", np.arange(nx)),
+        },
+    )
+    return naqfc.pin_time_encoding(cube)
+
+
+def write_cycle(store: object, cube: xr.Dataset) -> str:
+    plan = write_plan(cube, store_reference_times(store))
+    plan.cube.vz.to_icechunk(store, **plan.kwargs)
+    return plan.mode
+
+
+def test_forward_writes_create_then_append_then_region(
+    local_repo: Repository, tmp_path: pathlib.Path
+) -> None:
+    """The three modes in the order a deployment meets them, against a real
+    store: the first cycle creates it, the next extends the axis, and a cycle
+    already on the axis is rewritten in place rather than duplicated."""
+    chunks = tmp_path / "chunks"
+    session = local_repo.writable_session("main")
+
+    assert (
+        write_cycle(
+            session.store, virtual_cycle_cube(chunks, "2025-01-01T06:00:00", 1.0)
+        )
+        == "create"
+    )
+    assert (
+        write_cycle(
+            session.store, virtual_cycle_cube(chunks, "2025-01-01T12:00:00", 2.0)
+        )
+        == "append"
+    )
+    assert (
+        write_cycle(
+            session.store, virtual_cycle_cube(chunks, "2025-01-01T06:00:00", 3.0)
+        )
+        == "region"
+    )
+
+    cube = xr.open_zarr(session.store, consolidated=False, zarr_format=3)
+
+    assert list(cube.reference_time.values) == [
+        np.datetime64("2025-01-01T06:00:00", "ns"),
+        np.datetime64("2025-01-01T12:00:00", "ns"),
+    ]
+    # the re-delivered 06z cycle replaced its row; the 12z row is untouched
+    assert (cube[naqfc.VARIABLE].isel(reference_time=0).values == 3.0).all()
+    assert (cube[naqfc.VARIABLE].isel(reference_time=1).values == 2.0).all()
+    # and the grid coordinates survived a region write that could not carry them
+    assert list(cube.y.values) == [0, 1] and list(cube.x.values) == [0, 1]

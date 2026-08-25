@@ -35,7 +35,7 @@ def process_notification(
     if key and bucket:
         s3_uri = f"s3://{bucket}/{key}"
         logger.info(
-            "Append file",
+            "Process file",
             extra={"bucket": bucket, "key": key, "s3_uri": s3_uri},
         )
         # The full URI, not the bare key: the processor hands this straight to
