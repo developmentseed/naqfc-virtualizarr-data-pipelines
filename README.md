@@ -215,13 +215,13 @@ To configure each variable/domain pipeline stack you need to
     ```bash
     uv run scripts/generate_inventory.py \
       --domains CS --products ave_1hr_o3 \
-      --start 2024-05-14 --end 2026-08-20 --verify \
+      --start 2024-05-14 --end 2026-08-25 --verify \
       --upload s3://airquality-data-store-develop/naqfc/inventory/
     ```
 4. With the inventory created, you can initiate a backfill run that uses the inventory to virtualize all the referenced files. Run
     ```bash
-    ./scripts/start_backfill.sh -e .env_o3_conus o3-conus-20260820-2 \
-      s3://airquality-data-store-develop/naqfc/inventory/naqfc_aqmv7_cs_ave_1hr_o3_20240514_20260820.json
+    ./scripts/start_backfill.sh -e .env_o3_conus o3-conus-20260825-2 \
+      s3://airquality-data-store-develop/naqfc/inventory/naqfc_aqmv7_cs_ave_1hr_o3_20240514_20260825.json
     ```
 
 5. Once the backfill is successfully completed, the pipeline stack can begin processing messages added to the forward processing queue. Edit `.env_o3_conus` set `FORWARD_QUEUE_ENABLED=true` and re-deploy and your stack will now automatically process incoming messages.
@@ -248,55 +248,55 @@ Generate and upload one verified inventory for each domain/product pair:
 ```bash
 uv run scripts/generate_inventory.py \
   --domains CS --products ave_1hr_o3 \
-  --start 2024-05-14 --end 2026-08-20 --verify \
+  --start 2024-05-14 --end 2026-08-25 --verify \
   --upload s3://airquality-data-store-develop/naqfc/inventory/  # done
 
 uv run scripts/generate_inventory.py \
   --domains AK --products ave_1hr_o3 \
-  --start 2024-05-14 --end 2026-08-20 --verify \
+  --start 2024-05-14 --end 2026-08-25 --verify \
   --upload s3://airquality-data-store-develop/naqfc/inventory/  # done
 
 uv run scripts/generate_inventory.py \
   --domains HI --products ave_1hr_o3 \
-  --start 2024-05-14 --end 2026-08-20 --verify \
+  --start 2024-05-14 --end 2026-08-25 --verify \
   --upload s3://airquality-data-store-develop/naqfc/inventory/  # done
 
 uv run scripts/generate_inventory.py \
   --domains CS --products ave_1hr_pm25 \
-  --start 2024-05-14 --end 2026-08-20 --verify \
+  --start 2024-05-14 --end 2026-08-25 --verify \
   --upload s3://airquality-data-store-develop/naqfc/inventory/
 
 uv run scripts/generate_inventory.py \
   --domains AK --products ave_1hr_pm25 \
-  --start 2024-05-14 --end 2026-08-20 --verify \
+  --start 2024-05-14 --end 2026-08-25 --verify \
   --upload s3://airquality-data-store-develop/naqfc/inventory/
 
 uv run scripts/generate_inventory.py \
   --domains HI --products ave_1hr_pm25 \
-  --start 2024-05-14 --end 2026-08-20 --verify \
+  --start 2024-05-14 --end 2026-08-25 --verify \
   --upload s3://airquality-data-store-develop/naqfc/inventory/
 ```
 
 Start one backfill execution per stack after its inventory has uploaded:
 
 ```bash
-./scripts/start_backfill.sh -e .env_o3_conus o3-conus-20260820-2 \
-  s3://airquality-data-store-develop/naqfc/inventory/naqfc_aqmv7_cs_ave_1hr_o3_20240514_20260820.json  # done
+./scripts/start_backfill.sh -e .env_o3_conus o3-conus-20260825 \
+  s3://airquality-data-store-develop/naqfc/inventory/naqfc_aqmv7_cs_ave_1hr_o3_20240514_20260825.json  # done
 
-./scripts/start_backfill.sh -e .env_o3_ak o3-ak-20260820 \
-  s3://airquality-data-store-develop/naqfc/inventory/naqfc_aqmv7_ak_ave_1hr_o3_20240514_20260820.json  # done
+./scripts/start_backfill.sh -e .env_o3_ak o3-ak-20260825 \
+  s3://airquality-data-store-develop/naqfc/inventory/naqfc_aqmv7_ak_ave_1hr_o3_20240514_20260825.json  # done
 
-./scripts/start_backfill.sh -e .env_o3_hi o3-hi-20260820 \
-  s3://airquality-data-store-develop/naqfc/inventory/naqfc_aqmv7_hi_ave_1hr_o3_20240514_20260820.json  # done
+./scripts/start_backfill.sh -e .env_o3_hi o3-hi-20260825 \
+  s3://airquality-data-store-develop/naqfc/inventory/naqfc_aqmv7_hi_ave_1hr_o3_20240514_20260825.json  # done
 
-./scripts/start_backfill.sh -e .env_pm25_conus pm25-conus-20260820 \
-  s3://airquality-data-store-develop/naqfc/inventory/naqfc_aqmv7_cs_ave_1hr_pm25_20240514_20260820.json
+./scripts/start_backfill.sh -e .env_pm25_conus pm25-conus-20260825 \
+  s3://airquality-data-store-develop/naqfc/inventory/naqfc_aqmv7_cs_ave_1hr_pm25_20240514_20260825.json
 
-./scripts/start_backfill.sh -e .env_pm25_ak pm25-ak-20260820 \
-  s3://airquality-data-store-develop/naqfc/inventory/naqfc_aqmv7_ak_ave_1hr_pm25_20240514_20260820.json
+./scripts/start_backfill.sh -e .env_pm25_ak pm25-ak-20260825 \
+  s3://airquality-data-store-develop/naqfc/inventory/naqfc_aqmv7_ak_ave_1hr_pm25_20240514_20260825.json
 
-./scripts/start_backfill.sh -e .env_pm25_hi pm25-hi-20260820 \
-  s3://airquality-data-store-develop/naqfc/inventory/naqfc_aqmv7_hi_ave_1hr_pm25_20240514_20260820.json
+./scripts/start_backfill.sh -e .env_pm25_hi pm25-hi-20260825 \
+  s3://airquality-data-store-develop/naqfc/inventory/naqfc_aqmv7_hi_ave_1hr_pm25_20240514_20260825.json
 ```
 
 After each execution succeeds, enable forward processing and redeploy that stack
