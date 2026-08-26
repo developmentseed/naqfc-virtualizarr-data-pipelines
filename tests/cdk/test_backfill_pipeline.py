@@ -13,10 +13,12 @@ def _template() -> Template:
         env=cdk.Environment(account="111111111111", region="us-east-1"),
     )
     bucket = s3.Bucket(stack, "IceBucket")
+    backfill_bucket = s3.Bucket(stack, "BackfillBucket")
     BackfillPipeline(
         stack,
         "Backfill",
         icechunk_bucket=bucket,
+        backfill_bucket=backfill_bucket,
         icechunk_prefix=None,
         data_bucket_name="my-data-bucket",
         partition_size=500,
@@ -72,12 +74,14 @@ def _state_machine_asl() -> str:
         env=cdk.Environment(account="111111111111", region="us-east-1"),
     )
     bucket = s3.Bucket(stack, "IceBucket")
+    backfill_bucket = s3.Bucket(stack, "BackfillBucket")
     BackfillPipeline(
         stack,
         "Backfill",
         icechunk_bucket=bucket,
+        backfill_bucket=backfill_bucket,
         icechunk_prefix=None,
-        s3_prefix="naqfc",
+        backfill_prefix="naqfc",
         data_bucket_name="my-data-bucket",
         partition_size=500,
         max_items_per_batch=10,
@@ -117,8 +121,8 @@ def test_state_machine_shape() -> None:
 
 
 STORE = "arn:<REF>:s3:::ice-test/naqfc/aqmv7/o3_conus/*"
-RUN = "arn:<REF>:s3:::ice-test/naqfc/backfill/*"
-INVENTORY = "arn:<REF>:s3:::ice-test/naqfc/inventory/*"
+RUN = "arn:<REF>:s3:::backfill-test/naqfc/backfill/*"
+INVENTORY = "arn:<REF>:s3:::backfill-test/naqfc/inventory/*"
 
 
 def _scoped_template() -> Template:
@@ -129,12 +133,16 @@ def _scoped_template() -> Template:
         env=cdk.Environment(account="111111111111", region="us-east-1"),
     )
     bucket = s3.Bucket.from_bucket_name(stack, "IceBucket", "ice-test")
+    backfill_bucket = s3.Bucket.from_bucket_name(
+        stack, "BackfillBucket", "backfill-test"
+    )
     BackfillPipeline(
         stack,
         "Backfill",
         icechunk_bucket=bucket,
+        backfill_bucket=backfill_bucket,
         icechunk_prefix="naqfc/aqmv7/o3_conus",
-        s3_prefix="naqfc",
+        backfill_prefix="naqfc",
         inventory_prefix="naqfc/inventory",
         data_bucket_name="my-data-bucket",
         partition_size=500,
@@ -159,17 +167,15 @@ def test_repo_lambdas_scoped_to_store_and_run_prefixes() -> None:
         stmts = list(iam_statements(template, f"{action}fn"))
         writes = [s for s in stmts if "s3:PutObject" in actions_of(s)]
         assert writes, action
-        assert all(resources_of(s) == [STORE, RUN] for s in writes), action
-        assert any(
-            "s3:ListBucket" in actions_of(s)
-            and s.get("Condition")
-            == {
-                "StringLike": {
-                    "s3:prefix": ["naqfc/aqmv7/o3_conus/*", "naqfc/backfill/*"]
-                }
-            }
+        assert {tuple(resources_of(s)) for s in writes} == {(STORE,), (RUN,)}, action
+        assert {
+            tuple(s["Condition"]["StringLike"]["s3:prefix"])
             for s in stmts
-        ), action
+            if "s3:ListBucket" in actions_of(s) and s.get("Condition")
+        } == {
+            ("naqfc/aqmv7/o3_conus/*",),
+            ("naqfc/backfill/*",),
+        }, action
 
 
 def test_no_icechunk_prefix_keeps_bucket_wide_grant() -> None:

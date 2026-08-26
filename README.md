@@ -94,10 +94,13 @@ Backfill is configured through the same [settings module](./cdk/settings.py) / `
   partition becomes one merged commit.
 - **BACKFILL_MAX_ITEMS_PER_BATCH** (default `10`) — number of file keys processed by each worker Lambda (the inner Distributed Map's batch size). Each batch becomes one child fork.  Keep Lambda timeout limits in mind when configuring this.
 - **BACKFILL_MAX_CONCURRENCY** (default `50`) — maximum number of worker Lambdas running in parallel within a partition.  Note that if you are using dependent rate limited APIs like NASA EDL use appropriate settings here to avoid service throttling.
-- **ICECHUNK_BUCKET** - optional existing bucket for the Icechunk store and per-run fork artifacts. It must be in the stack's region; deployment checks its actual region and fails otherwise.
+- **ICECHUNK_BUCKET** - optional existing bucket for the Icechunk store.
 - **ICECHUNK_BUCKET_NAME** - name for the bucket to create when `ICECHUNK_BUCKET` is unset.
-- **S3_PREFIX** - optional common key prefix for all pipeline output. Backfill manifests and fork artifacts are written to `<S3_PREFIX>/backfill/<execution-name>/`.
-- **ICECHUNK_PREFIX** - dataset-specific Icechunk key prefix, relative to `S3_PREFIX`. For example, `S3_PREFIX=naqfc` with `ICECHUNK_PREFIX=aqmv7/o3_conus` creates the store at `naqfc/aqmv7/o3_conus`.
+- **ICECHUNK_PREFIX** - Icechunk key prefix. For example, `naqfc/aqmv7/o3_conus` creates the store at that key prefix.
+- **ICECHUNK_REGION** - region of an existing Icechunk bucket outside the stack's region. Leave unset for an in-region bucket.
+- **BACKFILL_BUCKET** - optional existing bucket for backfill inventories, manifests, and fork artifacts. It must be in the stack's region.
+- **BACKFILL_BUCKET_NAME** - name for the backfill artifacts bucket to create when `BACKFILL_BUCKET` is unset.
+- **BACKFILL_PREFIX** - optional key prefix for backfill artifacts. Manifests and forks are written to `<BACKFILL_PREFIX>/backfill/<execution-name>/`; inventories default to `<BACKFILL_PREFIX>/inventory/`.
 - **DATA_BUCKET_NAME** - the source bucket workers read files from.
 
 #### Running Backfill Processing
@@ -141,10 +144,10 @@ The `processor` protocol methods below drive **forward processing**:
   processing modes and is invoked on the schedule set by `GARBAGE_COLLECTION_FREQUENCY`.
 
 #### Forward Processing Configuration
-- **ICECHUNK_BUCKET** - optional existing bucket for the Icechunk store. It must be in the stack's region; deployment checks its actual region and fails otherwise.
+- **ICECHUNK_BUCKET** - optional existing bucket for the Icechunk store.
 - **ICECHUNK_BUCKET_NAME** - name for the bucket to create when `ICECHUNK_BUCKET` is unset.
-- **S3_PREFIX** - optional common key prefix for all pipeline output.
-- **ICECHUNK_PREFIX** - dataset-specific Icechunk key prefix, relative to `S3_PREFIX`.
+- **ICECHUNK_PREFIX** - optional key prefix for the Icechunk store.
+- **ICECHUNK_REGION** - region of an existing Icechunk bucket outside the stack's region. Leave unset for an in-region bucket.
 - **DATA_BUCKET_NAME** - the source bucket workers read files from.
 - **SNS_TOPIC** - the SNS topic ARN for the data bucket to subscribe to
   notifications for newly published files.
@@ -204,8 +207,10 @@ To configure each variable/domain pipeline stack you need to
 1. Edit the corresponding provided `.env` file.  Let's use the NAQFC o3/Conus data
    as an example.  Open the `.env_o3_conus` file and update the relevant
    settings. In most cases this will be your `ACCOUNT_ID` and
-   `ICECHUNK_BUCKET` (if your account has a pre-existing bucket in the stack's
-   region where the Icechunk store will be written).
+   `ICECHUNK_BUCKET` and `BACKFILL_BUCKET` (if your account has pre-existing
+   buckets for the Icechunk store and backfill artifacts). Set `ICECHUNK_REGION`
+   when the Icechunk bucket is outside the stack's region; the backfill bucket
+   must remain in the stack's region.
 2. Run the following to deploy a pipeline stack specifically for the o3/Conus
    variable.
     ```bash

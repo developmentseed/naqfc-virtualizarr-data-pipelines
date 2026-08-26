@@ -1,6 +1,6 @@
 from typing import Any
 
-from aws_cdk import Aws, Duration
+from aws_cdk import Duration
 from aws_cdk import aws_ecr_assets as ecr_assets
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_lambda as lmb
@@ -31,14 +31,16 @@ class BackfillPipeline(Construct):
         construct_id: str,
         *,
         icechunk_bucket: s3.IBucket,
-        icechunk_prefix: str | None,
+        backfill_bucket: s3.IBucket,
         data_bucket_name: str,
+        icechunk_prefix: str | None = None,
+        icechunk_region: str | None = None,
         earthdata_secret_arn: str | None = None,
         partition_size: int,
         max_items_per_batch: int,
         max_concurrency: int,
         naqfc_env: dict[str, str] | None = None,
-        s3_prefix: str | None = None,
+        backfill_prefix: str | None = None,
         inventory_prefix: str | None = None,
         **kwargs: Any,
     ) -> None:
@@ -47,10 +49,9 @@ class BackfillPipeline(Construct):
         # Icechunk >=2.1.0 refuses to create a repo at an empty prefix, so the
         # init handler needs ICECHUNK_PREFIX to reach the Lambda. Only include env
         # keys when set so synth doesn't inject a None value.
-        env = {
-            "ICECHUNK_BUCKET": icechunk_bucket.bucket_name,
-            "ICECHUNK_REGION": Aws.REGION,
-        }
+        env = {"ICECHUNK_BUCKET": icechunk_bucket.bucket_name}
+        if icechunk_region:
+            env["ICECHUNK_REGION"] = icechunk_region
         if icechunk_prefix:
             env["ICECHUNK_PREFIX"] = icechunk_prefix
         if earthdata_secret_arn:
@@ -70,9 +71,10 @@ class BackfillPipeline(Construct):
         )
 
         # Backfill scratch space (partition manifests + pickled forks) lives
-        # under {s3_prefix}/backfill/, outside the store prefix; keep this in
-        # step with run_prefix in _build_state_machine.
-        run_key_prefix = f"{s3_prefix}/backfill" if s3_prefix else "backfill"
+        # under BACKFILL_PREFIX/backfill/.
+        run_key_prefix = (
+            f"{backfill_prefix}/backfill" if backfill_prefix else "backfill"
+        )
 
         self.functions: dict[str, lmb.DockerImageFunction] = {}
         for action in _ACTIONS:
@@ -90,16 +92,12 @@ class BackfillPipeline(Construct):
                 memory_size=2048,
                 environment=dict(env),
             )
-            if not icechunk_prefix:
-                icechunk_bucket.grant_read_write(fn)
-            elif action == "partition":
-                # partition never opens the repo: it reads the inventory and
-                # writes partition manifests under the run prefix.
-                grant_prefixed_read_write(fn, icechunk_bucket, [run_key_prefix])
+            if action == "partition":
+                # partition never opens the repo; it only reads the inventory.
+                grant_prefixed_read_write(fn, backfill_bucket, [run_key_prefix])
             else:
-                grant_prefixed_read_write(
-                    fn, icechunk_bucket, [icechunk_prefix, run_key_prefix]
-                )
+                grant_prefixed_read_write(fn, icechunk_bucket, [icechunk_prefix])
+                grant_prefixed_read_write(fn, backfill_bucket, [run_key_prefix])
             # Handlers that open the repo need to read the Earthdata secret.
             if earthdata_secret is not None and action in _REPO_ACTIONS:
                 earthdata_secret.grant_read(fn)
@@ -117,12 +115,12 @@ class BackfillPipeline(Construct):
         self.functions["worker"].add_to_role_policy(data_policy)
         self.functions["partition"].add_to_role_policy(data_policy)
 
-        if icechunk_prefix and inventory_prefix:
+        if backfill_prefix and inventory_prefix:
             self.functions["partition"].add_to_role_policy(
                 iam.PolicyStatement(
                     actions=["s3:GetObject"],
                     resources=[
-                        icechunk_bucket.arn_for_objects(
+                        backfill_bucket.arn_for_objects(
                             f"{inventory_prefix.strip('/')}/*"
                         )
                     ],
@@ -130,8 +128,8 @@ class BackfillPipeline(Construct):
             )
 
         self.state_machine = self._build_state_machine(
-            icechunk_bucket,
-            s3_prefix,
+            backfill_bucket,
+            backfill_prefix,
             partition_size,
             max_items_per_batch,
             max_concurrency,
@@ -139,17 +137,17 @@ class BackfillPipeline(Construct):
 
     def _build_state_machine(
         self,
-        icechunk_bucket: s3.IBucket,
-        s3_prefix: str | None,
+        backfill_bucket: s3.IBucket,
+        backfill_prefix: str | None,
         partition_size: int,
         max_items_per_batch: int,
         max_concurrency: int,
     ) -> sfn.StateMachine:
         run_prefix = sfn.JsonPath.format(
-            f"s3://{{}}/{s3_prefix}/backfill/{{}}/"
-            if s3_prefix
+            f"s3://{{}}/{backfill_prefix}/backfill/{{}}/"
+            if backfill_prefix
             else "s3://{}/backfill/{}/",
-            icechunk_bucket.bucket_name,
+            backfill_bucket.bucket_name,
             sfn.JsonPath.string_at("$$.Execution.Name"),
         )
         partition = tasks.LambdaInvoke(
@@ -204,7 +202,7 @@ class BackfillPipeline(Construct):
             self,
             "InnerMap",
             item_reader=sfn.S3JsonItemReader(
-                bucket=icechunk_bucket,
+                bucket=backfill_bucket,
                 # manifest_key comes from the partition item ($ here is the outer
                 # Map iteration state); the fork result does not carry it.
                 key=sfn.JsonPath.string_at("$.manifest_key"),

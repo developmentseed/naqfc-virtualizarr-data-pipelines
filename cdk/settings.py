@@ -30,16 +30,17 @@ class StackSettings(BaseSettings):
     ACCOUNT_REGION: str = "us-east-1"
     ICECHUNK_BUCKET_NAME: str = "icechunk-outuput"
     ICECHUNK_BUCKET: str | None = None
-    # Common key prefix for every output written by this deployment. Backfill
-    # artifacts are placed directly below it; ICECHUNK_PREFIX is relative to it.
-    S3_PREFIX: str | None = None
-    # Dataset-specific suffix for the Icechunk repo. Icechunk >=2.1.0 refuses to
-    # create a repo at the bucket root, so S3_PREFIX or ICECHUNK_PREFIX must be
-    # non-empty to bootstrap a new store. Passed into Lambda as the combined path.
+    # Key prefix for this dataset's repo. Icechunk >=2.1.0 refuses to create a
+    # repo at the bucket root.
     ICECHUNK_PREFIX: str | None = None
-    # Key prefix in the Icechunk bucket where backfill inventories are uploaded
-    # (see README: s3://<bucket>/naqfc/inventory/). The backfill partition
-    # Lambda is granted read on this prefix only.
+    # Region of the Icechunk bucket. Set this only when the bucket is outside
+    # the stack's region; otherwise Icechunk resolves it from the Lambda.
+    ICECHUNK_REGION: str | None = None
+    # Backfill artifacts (inventories, manifests, and fork pickles) live in
+    # their own bucket and prefix.
+    BACKFILL_BUCKET_NAME: str = "backfill-artifacts"
+    BACKFILL_BUCKET: str | None = None
+    BACKFILL_PREFIX: str | None = None
     INVENTORY_PREFIX: str | None = None
     DATA_BUCKET_NAME: str | None = None
     PROJECT: str = "virtualizarr-data-pipelines"
@@ -116,39 +117,21 @@ class StackSettings(BaseSettings):
     FORWARD_QUEUE_ENABLED: bool | None = None
 
     @property
-    def s3_key_prefix(self) -> str | None:
-        """Return the normalized global S3 key prefix."""
-        return self.S3_PREFIX.strip("/") if self.S3_PREFIX else None
+    def icechunk_storage_prefix(self) -> str | None:
+        """Return the normalized Icechunk key prefix."""
+        return self.ICECHUNK_PREFIX.strip("/") if self.ICECHUNK_PREFIX else None
 
     @property
-    def icechunk_storage_prefix(self) -> str | None:
-        """Return the global and dataset-specific prefixes as one S3 key prefix."""
-        return (
-            "/".join(
-                prefix.strip("/")
-                for prefix in (self.S3_PREFIX, self.ICECHUNK_PREFIX)
-                if prefix and prefix.strip("/")
-            )
-            or None
-        )
+    def backfill_key_prefix(self) -> str | None:
+        """Return the normalized backfill artifact key prefix."""
+        return self.BACKFILL_PREFIX.strip("/") if self.BACKFILL_PREFIX else None
 
     @property
     def inventory_prefix(self) -> str:
         """Key prefix the backfill partition Lambda may read inventories from."""
         if self.INVENTORY_PREFIX:
             return self.INVENTORY_PREFIX.strip("/")
-        return "/".join(p for p in (self.s3_key_prefix, "inventory") if p)
-
-    @model_validator(mode="after")
-    def _validate_prefixes(self) -> "StackSettings":
-        """Keep the Icechunk prefix relative to the global output prefix."""
-        icechunk_prefix = (self.ICECHUNK_PREFIX or "").strip("/")
-        if self.s3_key_prefix and (
-            icechunk_prefix == self.s3_key_prefix
-            or icechunk_prefix.startswith(f"{self.s3_key_prefix}/")
-        ):
-            raise ValueError("ICECHUNK_PREFIX must be relative to S3_PREFIX")
-        return self
+        return "/".join(p for p in (self.backfill_key_prefix, "inventory") if p)
 
     @model_validator(mode="after")
     def _resolve_naqfc_grid(self) -> "StackSettings":

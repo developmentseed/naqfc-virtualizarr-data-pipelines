@@ -1,4 +1,3 @@
-import textwrap
 from typing import Any
 
 from aws_cdk import (
@@ -84,68 +83,11 @@ class VirtualizarrSqsStack(Stack):
                 queue=self.dlq,
             ),
         )
-        self.icechunk_bucket_region_validator: CustomResource | None = None
         if settings.ICECHUNK_BUCKET:
             self.icechunk_bucket = s3.Bucket.from_bucket_name(
                 self,
                 f"{settings.STACK_NAME}-bucket",
                 bucket_name=settings.ICECHUNK_BUCKET,
-            )
-            validator = _lambda.Function(
-                self,
-                "ValidateIcechunkBucketRegionFunction",
-                runtime=_lambda.Runtime.PYTHON_3_12,
-                handler="index.handler",
-                timeout=Duration.seconds(30),
-                code=_lambda.Code.from_inline(
-                    textwrap.dedent(
-                        """\
-                        import boto3
-
-
-                        def handler(event, _context):
-                            if event["RequestType"] == "Delete":
-                                return {
-                                    "PhysicalResourceId": event["PhysicalResourceId"]
-                                }
-
-                            bucket = event["ResourceProperties"]["BucketName"]
-                            expected = event["ResourceProperties"]["ExpectedRegion"]
-                            location = boto3.client("s3").get_bucket_location(
-                                Bucket=bucket
-                            )["LocationConstraint"]
-                            actual = {None: "us-east-1", "EU": "eu-west-1"}.get(
-                                location, location
-                            )
-                            if actual != expected:
-                                raise ValueError(
-                                    f"Icechunk bucket {bucket!r} is in {actual!r}; "
-                                    f"expected {expected!r}"
-                                )
-                            return {"PhysicalResourceId": f"{bucket}:{actual}"}
-                        """
-                    )
-                ),
-            )
-            validator.add_to_role_policy(
-                iam.PolicyStatement(
-                    actions=["s3:GetBucketLocation"],
-                    resources=[self.icechunk_bucket.bucket_arn],
-                )
-            )
-            provider = cr.Provider(
-                self,
-                "ValidateIcechunkBucketRegionProvider",
-                on_event_handler=validator,
-            )
-            self.icechunk_bucket_region_validator = CustomResource(
-                self,
-                "ValidateIcechunkBucketRegion",
-                service_token=provider.service_token,
-                properties={
-                    "BucketName": self.icechunk_bucket.bucket_name,
-                    "ExpectedRegion": settings.ACCOUNT_REGION,
-                },
             )
         else:
             self.icechunk_bucket = s3.Bucket(
@@ -158,17 +100,15 @@ class VirtualizarrSqsStack(Stack):
             self,
             "IcechunkBucketName",
             value=self.icechunk_bucket.bucket_name,
-            description="Icechunk bucket for backfill inventory under INVENTORY_PREFIX "
-            "(default {S3_PREFIX}/inventory/). Partition Lambda has read-only access.",
+            description="Icechunk store bucket.",
         )
 
         # Shared processor env: resolved by virtualizarr_processor at runtime to
         # open the icechunk store (ICECHUNK_BUCKET set => S3) and to read protected
         # GES DISC granules via Earthdata (EARTHDATA_SECRET_ARN).
-        self.processor_env = {
-            "ICECHUNK_BUCKET": self.icechunk_bucket.bucket_name,
-            "ICECHUNK_REGION": settings.ACCOUNT_REGION,
-        }
+        self.processor_env = {"ICECHUNK_BUCKET": self.icechunk_bucket.bucket_name}
+        if settings.ICECHUNK_REGION:
+            self.processor_env["ICECHUNK_REGION"] = settings.ICECHUNK_REGION
         if settings.icechunk_storage_prefix:
             self.processor_env["ICECHUNK_PREFIX"] = settings.icechunk_storage_prefix
         if settings.EARTHDATA_SECRET_ARN:
@@ -410,13 +350,37 @@ class VirtualizarrSqsStack(Stack):
             )
 
         if settings.BACKFILL_ENABLED:
+            if settings.BACKFILL_BUCKET:
+                self.backfill_bucket = s3.Bucket.from_bucket_name(
+                    self,
+                    "BackfillArtifactsBucket",
+                    bucket_name=settings.BACKFILL_BUCKET,
+                )
+            else:
+                self.backfill_bucket = s3.Bucket(
+                    self,
+                    "BackfillArtifactsBucket",
+                    bucket_name=settings.BACKFILL_BUCKET_NAME,
+                )
+
+            CfnOutput(
+                self,
+                "BackfillBucketName",
+                value=self.backfill_bucket.bucket_name,
+                description=(
+                    "Backfill artifacts bucket for inventories, manifests, and forks."
+                ),
+            )
+
             self.backfill_pipeline = BackfillPipeline(
                 self,
                 "BackfillPipeline",
                 icechunk_bucket=self.icechunk_bucket,
+                backfill_bucket=self.backfill_bucket,
                 icechunk_prefix=settings.icechunk_storage_prefix,
+                icechunk_region=settings.ICECHUNK_REGION,
+                backfill_prefix=settings.backfill_key_prefix,
                 inventory_prefix=settings.inventory_prefix,
-                s3_prefix=settings.s3_key_prefix,
                 data_bucket_name=settings.DATA_BUCKET_NAME,
                 partition_size=settings.BACKFILL_PARTITION_SIZE,
                 max_items_per_batch=settings.BACKFILL_MAX_ITEMS_PER_BATCH,

@@ -8,8 +8,10 @@ from settings import StackSettings
 from stack import VirtualizarrSqsStack
 
 STORE_OBJECTS = "arn:<REF>:s3:::ice-test/naqfc/aqmv7/o3_conus/*"
+INVENTORY_OBJECTS = "arn:<REF>:s3:::backfill-test/naqfc/inventory/*"
 BUCKET_ARN = "arn:<REF>:s3:::ice-test"
 BUCKET_WIDE = "arn:<REF>:s3:::ice-test/*"
+BACKFILL_BUCKET_WIDE = "arn:<REF>:s3:::backfill-test/*"
 WRITE_ACTIONS = [
     "s3:GetObject",
     "s3:PutObject",
@@ -61,9 +63,10 @@ def _stack_template(**overrides: object) -> Template:
         STAGE="dev",
         ACCOUNT_ID="111111111111",
         ICECHUNK_BUCKET="ice-test",
+        BACKFILL_BUCKET="backfill-test",
         DATA_BUCKET_NAME="data-test",
-        S3_PREFIX="naqfc",
-        ICECHUNK_PREFIX="aqmv7/o3_conus",
+        ICECHUNK_PREFIX="naqfc/aqmv7/o3_conus",
+        BACKFILL_PREFIX="naqfc",
         INVENTORY_PREFIX=None,
     )
     kwargs.update(overrides)
@@ -97,20 +100,20 @@ def test_no_bucket_wide_writes_remain_when_prefix_set(backfill: bool) -> None:
     for stmt in iam_statements(template):
         if any(a.startswith(("s3:Put", "s3:Delete")) for a in actions_of(stmt)):
             assert BUCKET_WIDE not in resources_of(stmt)
+            assert BACKFILL_BUCKET_WIDE not in resources_of(stmt)
 
 
 def test_backfill_partition_gets_inventory_grant_from_settings() -> None:
     template = _stack_template(BACKFILL_ENABLED=True)
     stmts = list(iam_statements(template, "partitionfn"))
     assert any(
-        resources_of(s) == ["arn:<REF>:s3:::ice-test/naqfc/inventory/*"]
-        and actions_of(s) == ["s3:GetObject"]
+        resources_of(s) == [INVENTORY_OBJECTS] and actions_of(s) == ["s3:GetObject"]
         for s in stmts
     )
 
 
 def test_no_prefix_keeps_bucket_wide_grant() -> None:
-    template = _stack_template(S3_PREFIX=None, ICECHUNK_PREFIX=None)
+    template = _stack_template(ICECHUNK_PREFIX=None)
     stmts = list(iam_statements(template, "processmessageslambda"))
     assert any(
         BUCKET_WIDE in resources_of(s) and "s3:DeleteObject*" in actions_of(s)
