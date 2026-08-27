@@ -19,6 +19,11 @@ So both sides go through here: ``initialize_backfill_store`` calls
 ``cycle_reference_times()`` and ``scripts/generate_inventory.py`` calls
 ``cycle_urls()``, which keeps the extent and the file list in step.
 
+Forward processing derives its axis from the same place, through
+``schedule_between()``: a cycle arriving past the end of the store extends the
+axis over the schedule rather than over what happened to be delivered, so
+out-of-order arrivals cannot leave ``reference_time`` non-monotonic.
+
 Layout on the public bucket::
 
     s3://noaa-nws-naqfc-pds/AQMv7/CS/<YYYYMMDD>/<HH>/
@@ -33,7 +38,7 @@ from __future__ import annotations
 
 import os
 from datetime import date, timedelta
-from typing import TYPE_CHECKING, Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator, cast
 
 if TYPE_CHECKING:
     import numpy as np
@@ -84,6 +89,13 @@ END = os.environ.get("NAQFC_END", "2025-12-31")
 # to +65. A cycle that disagrees is rejected rather than padded (see
 # `cycle_cube`), so this must match the configured product.
 LEAD_HOURS = int(os.environ.get("NAQFC_LEAD_HOURS", "72"))
+
+# How far ahead of the store's last row a single arrival may reserve. A dense
+# axis has to be filled in to reach the arriving cycle, so one file with a
+# corrupt `reference_date` -- a year that parses but is decades out -- would
+# otherwise declare millions of rows. 730 is a year of two-cycle days: generous
+# for a store that has fallen behind, small enough to catch nonsense.
+MAX_RESERVED_CYCLES = int(os.environ.get("NAQFC_MAX_RESERVED_CYCLES", "730"))
 
 # The variable name the GRIB parser assigns to the decoded field. Ozone products
 # decode to `ozcon`, pm25 to `pmtf`, so this moves with the product.
@@ -184,6 +196,82 @@ def cycle_reference_times(
         ],
         dtype="datetime64[ns]",
     )
+
+
+# --- the cycle schedule ----------------------------------------------------
+#
+# Files arrive out of order: NAQFC publishes 06z and 12z within minutes of each
+# other and SNS makes no ordering promise, so a plain append writes whichever
+# landed first and leaves `reference_time` non-monotonic. The fix is to treat
+# the axis as the *schedule* rather than as whatever arrived -- a cycle past the
+# end of the store extends the axis over every cycle that should exist in
+# between, and those rows wait, empty, for the files that belong in them.
+#
+# That only works because the schedule is knowable in advance. It is: AQMv7 runs
+# at exactly the `CYCLES` hours, every day, in every domain.
+
+
+def scheduled_hours(cycle_hours: tuple[str, ...] | None = None) -> tuple[int, ...]:
+    """The hours of the day, UTC, at which this deployment's cycles run."""
+    return tuple(
+        sorted(int(h) for h in (CYCLES if cycle_hours is None else cycle_hours))
+    )
+
+
+def check_scheduled(
+    reference_times: "np.ndarray | np.datetime64",
+    cycle_hours: tuple[str, ...] | None = None,
+) -> None:
+    """Refuse a cycle time this deployment's schedule never produces.
+
+    Without this an off-schedule cycle is reindexed onto a schedule that
+    excludes it and its data is silently dropped instead of stored -- the same
+    asymmetry `region="auto"` has, and just as quiet. A file that fails here is
+    either a misconfigured `NAQFC_CYCLES` or a product that is not what the
+    deployment thinks it is; both want to be loud.
+    """
+    import numpy as np
+
+    hours = scheduled_hours(cycle_hours)
+    for value in np.atleast_1d(np.asarray(reference_times, dtype="datetime64[ns]")):
+        on_the_hour = value.astype("datetime64[h]")
+        if value != on_the_hour or on_the_hour.astype(object).hour not in hours:
+            raise ValueError(
+                f"{value} is not a scheduled cycle; this deployment runs at "
+                f"{', '.join(f'{h:02d}' for h in hours)} UTC. Reindexing onto a "
+                f"schedule that excludes it would drop its data, not store it."
+            )
+
+
+def schedule_between(
+    after: "np.datetime64",
+    through: "np.datetime64",
+    cycle_hours: tuple[str, ...] | None = None,
+) -> "np.ndarray":
+    """Every scheduled cycle strictly after `after`, up to and including `through`.
+
+    Bounded by cycle rather than by day, because the store's last row is itself
+    a cycle: a store ending at 06z that receives that day's 12z must extend by
+    exactly one row, not by the whole day.
+
+    Deliberately not `pd.date_range(freq=...)`: the cadence is irregular. 06z to
+    12z is 6 hours, 12z to the next 06z is 18, so a 6-hourly grid would invent
+    00z and 18z rows that no file can ever fill.
+    """
+    import numpy as np
+
+    hours = scheduled_hours(cycle_hours)
+    first = after.astype("datetime64[D]").astype(object)
+    last = through.astype("datetime64[D]").astype(object)
+    stamps = np.array(
+        [
+            np.datetime64(f"{day:%Y-%m-%d}T{hour:02d}:00:00", "ns")
+            for day in _daterange(first, last)
+            for hour in hours
+        ],
+        dtype="datetime64[ns]",
+    )
+    return cast("np.ndarray", stamps[(stamps > after) & (stamps <= through)])
 
 
 def lead_axis(lead_hours: int | None = None) -> "np.ndarray":

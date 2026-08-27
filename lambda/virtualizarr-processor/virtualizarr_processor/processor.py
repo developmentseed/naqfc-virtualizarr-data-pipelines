@@ -12,6 +12,14 @@ the same chunks with different values. Keyed by ``(reference_time, lead)``
 instead, every cycle owns a disjoint region and the fork/merge backfill has no
 conflicts to resolve.
 
+Forward processing does not assume cycles arrive in order. SNS fans out the 06z
+and 12z notifications within minutes of each other and promises nothing about
+which lands first, so appending whatever turns up leaves ``reference_time``
+non-monotonic. Each arrival is instead placed against the cycle schedule: one
+past the end of the store extends the axis over every cycle still in flight,
+reserving their rows, and a straggler is written into the row already waiting
+for it. `write_plan` is where that decision is made.
+
 Dataset layout, extent, and the cycle enumeration live in `naqfc`.
 """
 
@@ -70,34 +78,91 @@ def store_reference_times(store: Any) -> "np.ndarray | None":
     return cast("np.ndarray", cube["reference_time"].values)
 
 
+def _reserve(cube: "xr.Dataset", schedule: "np.ndarray") -> "xr.Dataset":
+    """Spread one cycle over `schedule`, reserving a row per cycle not yet here.
+
+    `reindex` is what makes this cheap: the rows it invents get no entries in
+    the chunk manifest at all, so they cost nothing to store and read back as
+    the array's fill value. Nothing is materialized -- the cycle's own chunks
+    stay virtual references into NOAA's bucket.
+
+    Re-pins the time encoding afterwards, which `reindex` does not carry over;
+    without it the appended block infers its own units and reads back wrong.
+    """
+    return naqfc.pin_time_encoding(cube.reindex(reference_time=schedule))
+
+
 def write_plan(cube: "xr.Dataset", existing: "np.ndarray | None") -> WritePlan:
-    """Choose between creating, region-writing, and appending one cycle.
+    """Choose how to write one cycle, given the `reference_time` axis it meets.
 
-    The deciding question is whether the store's `reference_time` axis already
-    carries this cycle:
+    Files arrive out of order, so appending whatever turns up leaves the axis
+    non-monotonic. Instead the axis is treated as the *schedule*: where a cycle
+    lands relative to it decides the write.
 
-    * **region** -- it does, so the row exists and must be written in place.
-      An append would add a second row with the same coordinate value, leaving
-      the axis non-monotonic and the cycle stored twice. This is the normal case
-      after a backfill: the store is declared at its full extent up front, so
-      every cycle inside that extent already has a (possibly empty) row waiting,
-      and it is also how a re-delivered notification lands harmlessly.
-    * **append** -- it does not, which is the forward case: a cycle past the
-      declared axis extends it by one row.
-    * **create** -- there is no array at all yet, the first file of a
-      forward-only deployment, where the write has to create the store.
+    * **region** -- the cycle is already on the axis. Its row exists, either
+      reserved by an earlier arrival that skipped over it or already filled by
+      this same cycle, and is written in place. A re-delivered notification
+      therefore rewrites its own row rather than adding a duplicate; the
+      references are identical, so it is idempotent.
+    * **append** -- the cycle is past the last row, so the axis is extended to
+      reach it. Every scheduled cycle in between gets a reserved row, which is
+      what lets a straggler land in `region` mode later instead of being
+      appended out of order.
+    * **create** -- there is no array yet, the first file of a forward-only
+      deployment.
+
+    Two cases have no write at all, because Zarr can only grow an axis at its
+    end: a cycle older than the store's first row, and one that falls inside the
+    axis on no row (a gap left by the append-anything behaviour that predates
+    schedule alignment). Both raise rather than write somewhere wrong.
 
     A region write goes through `naqfc.region_cube`, which drops the grid
     coordinates: they carry no `reference_time` dimension, so `region="auto"`
     has no slice to resolve for them. An append keeps them, where having no
     `reference_time` dimension means the already-written copies are left alone.
     """
+    reference_time = cube["reference_time"].values[0]
+    naqfc.check_scheduled(reference_time)
+
     if existing is None:
         return WritePlan("create", cube, {})
-    reference_time = cube["reference_time"].values[0]
+
     if bool((existing == reference_time).any()):
         return WritePlan("region", naqfc.region_cube(cube), {"region": "auto"})
-    return WritePlan("append", cube, {"append_dim": "reference_time"})
+
+    # max(), not the last element: a store written before schedule alignment may
+    # already be non-monotonic, and extending from anything but its high-water
+    # mark would write reference_time values it already holds.
+    last, first = existing.max(), existing.min()
+
+    if reference_time > last:
+        schedule = naqfc.schedule_between(last, reference_time)
+        if len(schedule) > naqfc.MAX_RESERVED_CYCLES:
+            raise ValueError(
+                f"cycle {reference_time} is {len(schedule)} cycles past the "
+                f"store's last row ({last}), over the {naqfc.MAX_RESERVED_CYCLES}"
+                " cycle limit; reaching it would reserve that many empty rows. "
+                "Raise NAQFC_MAX_RESERVED_CYCLES if the store really is that far "
+                "behind, or check the file's reference_date."
+            )
+        return WritePlan(
+            "append", _reserve(cube, schedule), {"append_dim": "reference_time"}
+        )
+
+    if reference_time < first:
+        raise ValueError(
+            f"cycle {reference_time} is older than the store, which starts at "
+            f"{first}; Zarr cannot prepend, so extending the archive backwards "
+            f"is a rebuild rather than an ingest"
+        )
+
+    raise ValueError(
+        f"cycle {reference_time} falls inside the store's axis ({first} .. "
+        f"{last}) but has no row of its own; Zarr cannot insert one in the "
+        f"middle. The axis has a gap that was never reserved, which is what a "
+        f"store appended to before schedule alignment looks like -- filling this "
+        f"cycle in means rebuilding it."
+    )
 
 
 class Processor:
@@ -206,16 +271,26 @@ class Processor:
         return repo.writable_session("main")
 
     def process_file(self, file_key: str, session: Session) -> bool:
-        """Write one cycle into `main`, region-writing or appending as needed.
+        """Write one cycle into `main`, wherever on the axis it belongs.
 
-        Which of the two depends on the file: a cycle whose `reference_time` is
-        already on the store's axis is written in place, one that is not extends
-        the axis by a row. `write_plan` holds the reasoning.
+        Cycles are delivered in whatever order SNS happens to fan them out, so
+        this does not simply append: `write_plan` places each one against the
+        store's schedule, extending the axis over any cycle still in flight and
+        writing a straggler into the row already reserved for it.
+
+        A cycle that cannot be placed at all -- older than the store, or in a
+        gap no row was reserved for -- is logged and reported as a failure
+        rather than written somewhere wrong.
         """
         try:
             cube = naqfc.cycle_cube(file_key)
             plan = write_plan(cube, store_reference_times(session.store))
-            logger.info("%s: %s write to main", file_key, plan.mode)
+            logger.info(
+                "%s: %s write to main (%d row(s))",
+                file_key,
+                plan.mode,
+                plan.cube.sizes["reference_time"],
+            )
             plan.cube.vz.to_icechunk(session.store, **plan.kwargs)
             return True
         except Exception:

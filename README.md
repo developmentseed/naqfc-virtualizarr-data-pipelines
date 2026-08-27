@@ -129,6 +129,13 @@ The `processor` protocol methods below drive **forward processing**:
   a writable Icechunk session.
 
 - **process_file** This method should take a file uri and a session and use a Virtualizarr parser to parse it and add the resulting ManifestStore or virtual dataset to the Icechunk store.
+  Files are not assumed to arrive in order. The NAQFC implementation places each cycle against the
+  schedule its collection runs on rather than appending blindly: a cycle past the end of the store
+  extends the axis over every cycle in between, leaving those rows reserved and empty, and a cycle
+  that arrives late is written into the row reserved for it. `reference_time` therefore stays
+  monotonic whatever order SNS delivers in. A cycle older than the store's first row, or one falling
+  in a gap no row was reserved for, cannot be placed — Zarr only grows an axis at its end — and is
+  reported as a failure rather than written out of order.
 
 - **commit_processed_files** This method commits all the changes made during the
   session in a single commit.

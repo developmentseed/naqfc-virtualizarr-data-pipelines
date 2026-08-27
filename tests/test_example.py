@@ -6,6 +6,7 @@ inventory both derive from, and the cube reshaping rules. The round trips that
 genuinely need bytes from NOAA's bucket are marked `network`.
 """
 
+import functools
 import pathlib
 from datetime import datetime, timedelta, timezone
 
@@ -194,7 +195,67 @@ def test_truncated_cycle_is_rejected() -> None:
         naqfc.cycle_cube(url, lead_hours=99)
 
 
-# --- forward write mode ----------------------------------------------------
+# --- the cycle schedule ----------------------------------------------------
+
+
+def test_schedule_starts_after_the_stores_last_row() -> None:
+    """The last row is itself a cycle, so a store ending at 06z that receives
+    that day's 12z extends by exactly one row -- not by the whole day."""
+    schedule = naqfc.schedule_between(
+        np.datetime64("2025-01-01T06:00:00", "ns"),
+        np.datetime64("2025-01-01T12:00:00", "ns"),
+    )
+
+    assert list(schedule) == [np.datetime64("2025-01-01T12:00:00", "ns")]
+
+
+def test_schedule_spans_the_irregular_overnight_gap() -> None:
+    """06z to 12z is 6 hours and 12z to the next 06z is 18, so a 6-hourly grid
+    would invent 00z and 18z rows that no file could ever fill."""
+    schedule = naqfc.schedule_between(
+        np.datetime64("2025-01-01T06:00:00", "ns"),
+        np.datetime64("2025-01-03T06:00:00", "ns"),
+    )
+
+    assert [str(t) for t in schedule] == [
+        "2025-01-01T12:00:00.000000000",
+        "2025-01-02T06:00:00.000000000",
+        "2025-01-02T12:00:00.000000000",
+        "2025-01-03T06:00:00.000000000",
+    ]
+
+
+def test_schedule_follows_the_configured_cycle_hours() -> None:
+    schedule = naqfc.schedule_between(
+        np.datetime64("2025-01-01T00:00:00", "ns"),
+        np.datetime64("2025-01-02T00:00:00", "ns"),
+        cycle_hours=("00", "06", "12", "18"),
+    )
+
+    assert len(schedule) == 4
+    assert [t.astype("datetime64[h]").astype(object).hour for t in schedule] == [
+        6,
+        12,
+        18,
+        0,
+    ]
+
+
+def test_an_unscheduled_cycle_hour_is_refused() -> None:
+    """Reindexing onto a schedule that excludes the cycle would drop its data
+    silently, so an off-schedule hour has to fail loudly instead."""
+    naqfc.check_scheduled(np.datetime64("2025-01-01T06:00:00", "ns"))
+
+    with pytest.raises(ValueError, match="not a scheduled cycle"):
+        naqfc.check_scheduled(np.datetime64("2025-01-01T18:00:00", "ns"))
+
+
+def test_a_cycle_off_the_hour_is_refused() -> None:
+    with pytest.raises(ValueError, match="not a scheduled cycle"):
+        naqfc.check_scheduled(np.datetime64("2025-01-01T06:30:00", "ns"))
+
+
+# --- placing a cycle on the axis -------------------------------------------
 
 
 def synthetic_cube(reference_time: str) -> xr.Dataset:
@@ -224,16 +285,79 @@ def test_write_plan_creates_when_the_store_is_empty() -> None:
     assert plan.kwargs == {}
 
 
-def test_write_plan_appends_a_cycle_off_the_end_of_the_axis() -> None:
+def test_write_plan_appends_the_next_scheduled_cycle_as_one_row() -> None:
+    """Nothing was skipped, so nothing is reserved."""
     existing = np.array(["2025-01-01T06:00:00"], dtype="datetime64[ns]")
 
     plan = write_plan(synthetic_cube("2025-01-01T12:00:00"), existing)
 
     assert plan.mode == "append"
     assert plan.kwargs == {"append_dim": "reference_time"}
+    assert plan.cube.sizes["reference_time"] == 1
     # the grid coordinates ride along: with no reference_time dimension they
     # leave the already-written copies alone rather than duplicating them
     assert "y" in plan.cube.coords
+
+
+def test_write_plan_reserves_a_row_for_every_cycle_it_skipped() -> None:
+    """The reserved rows are the whole point: a cycle still in flight gets an
+    address now, so when it lands it is a region write instead of an
+    out-of-order append."""
+    existing = np.array(["2025-01-01T06:00:00"], dtype="datetime64[ns]")
+
+    plan = write_plan(synthetic_cube("2025-01-02T06:00:00"), existing)
+
+    assert plan.mode == "append"
+    assert [str(t) for t in plan.cube.reference_time.values] == [
+        "2025-01-01T12:00:00.000000000",
+        "2025-01-02T06:00:00.000000000",
+    ]
+    # and the arriving cycle is in the row that belongs to it, not the first one
+    assert not np.isnan(plan.cube[naqfc.VARIABLE].values[1]).any()
+    assert np.isnan(plan.cube[naqfc.VARIABLE].values[0]).all()
+
+
+def test_write_plan_keeps_the_time_encoding_through_the_reindex() -> None:
+    """reindex does not carry encoding over, and a block written without it
+    infers `days since <first row>` and reads back wrong by a factor of 24."""
+    existing = np.array(["2025-01-01T06:00:00"], dtype="datetime64[ns]")
+
+    plan = write_plan(synthetic_cube("2025-01-02T06:00:00"), existing)
+
+    assert plan.cube["reference_time"].encoding["units"] == "hours since 1970-01-01"
+
+
+def test_write_plan_refuses_a_cycle_older_than_the_store() -> None:
+    """Zarr grows an axis only at its end."""
+    existing = np.array(["2025-01-01T12:00:00"], dtype="datetime64[ns]")
+
+    with pytest.raises(ValueError, match="older than the store"):
+        write_plan(synthetic_cube("2025-01-01T06:00:00"), existing)
+
+
+def test_write_plan_refuses_a_cycle_in_a_gap_no_row_was_reserved_for() -> None:
+    """What a store appended to before schedule alignment looks like: the 12z
+    row was never created, and Zarr cannot insert one in the middle."""
+    existing = np.array(
+        ["2025-01-01T06:00:00", "2025-01-02T06:00:00"], dtype="datetime64[ns]"
+    )
+
+    with pytest.raises(ValueError, match="no row of its own"):
+        write_plan(synthetic_cube("2025-01-01T12:00:00"), existing)
+
+
+def test_write_plan_refuses_to_reserve_more_rows_than_the_limit() -> None:
+    """A file whose reference_date parses but is decades out would otherwise
+    declare millions of empty rows to reach itself."""
+    existing = np.array(["2025-01-01T06:00:00"], dtype="datetime64[ns]")
+
+    with pytest.raises(ValueError, match="cycle limit"):
+        write_plan(synthetic_cube("2035-01-01T06:00:00"), existing)
+
+
+def test_write_plan_refuses_an_unscheduled_cycle_before_touching_the_store() -> None:
+    with pytest.raises(ValueError, match="not a scheduled cycle"):
+        write_plan(synthetic_cube("2025-01-01T18:00:00"), None)
 
 
 def test_write_plan_regions_a_cycle_already_on_the_axis() -> None:
@@ -316,21 +440,27 @@ def virtual_cycle_cube(
     """What `naqfc.cycle_cube` produces, with local bytes standing in for GRIB.
 
     Same dims, coords, encoding and one-message-per-chunk grid; only the chunks
-    point at a local file instead of a range inside a NAQFC object.
+    point at a local file instead of a range inside a NAQFC object. The fill
+    value is NaN, as a decoded GRIB float field's is, so a row with no chunk
+    reference is distinguishable from a row of real zeros.
     """
     from virtualizarr.manifests import ChunkManifest, ManifestArray
-    from zarr.codecs import BytesCodec
-    from zarr.core.dtype import parse_data_type
-    from zarr.core.metadata import ArrayV3Metadata
+    from virtualizarr.manifests.utils import create_v3_array_metadata
 
     ny = nx = 2
     data = np.full((n_lead, ny, nx), value, dtype="float32")
     chunk_bytes = data[0].nbytes
-    path = chunks / f"{reference_time.replace(':', '')}.bin"
+    path = chunks / f"{reference_time.replace(':', '')}-{value:g}.bin"
     path.write_bytes(data.tobytes())
 
-    dtype = parse_data_type(data.dtype, zarr_format=3)
     array = ManifestArray(
+        metadata=create_v3_array_metadata(
+            shape=(1, n_lead, ny, nx),
+            data_type=data.dtype,
+            chunk_shape=(1, 1, ny, nx),
+            fill_value=np.nan,
+            dimension_names=naqfc.DIMS,
+        ),
         chunkmanifest=ChunkManifest(
             {
                 f"0.{lead}.0.0": {
@@ -340,20 +470,6 @@ def virtual_cycle_cube(
                 }
                 for lead in range(n_lead)
             }
-        ),
-        metadata=ArrayV3Metadata(
-            shape=(1, n_lead, ny, nx),
-            data_type=dtype,
-            chunk_grid={
-                "name": "regular",
-                "configuration": {"chunk_shape": (1, 1, ny, nx)},
-            },
-            chunk_key_encoding={"name": "default"},
-            fill_value=dtype.default_scalar(),
-            codecs=[BytesCodec()],
-            attributes={},
-            dimension_names=naqfc.DIMS,
-            storage_transformers=None,
         ),
     )
     cube = xr.Dataset(
@@ -371,48 +487,123 @@ def virtual_cycle_cube(
     return naqfc.pin_time_encoding(cube)
 
 
-def write_cycle(store: object, cube: xr.Dataset) -> str:
-    plan = write_plan(cube, store_reference_times(store))
-    plan.cube.vz.to_icechunk(store, **plan.kwargs)
+def write_cycle(session: icechunk.Session, cube: xr.Dataset) -> str:
+    """One pass of what `process_file` does, minus the GRIB read."""
+    plan = write_plan(cube, store_reference_times(session.store))
+    plan.cube.vz.to_icechunk(session.store, **plan.kwargs)
     return plan.mode
 
 
-def test_forward_writes_create_then_append_then_region(
+def test_a_cycle_delivered_late_lands_in_the_row_reserved_for_it(
     local_repo: Repository, tmp_path: pathlib.Path
 ) -> None:
-    """The three modes in the order a deployment meets them, against a real
-    store: the first cycle creates it, the next extends the axis, and a cycle
-    already on the axis is rewritten in place rather than duplicated."""
+    """The whole point, against a real store: 12z is delivered after the next
+    day's 06z, and the axis still comes out in order with every row correct."""
     chunks = tmp_path / "chunks"
     session = local_repo.writable_session("main")
+    cube = functools.partial(virtual_cycle_cube, chunks)
 
-    assert (
-        write_cycle(
-            session.store, virtual_cycle_cube(chunks, "2025-01-01T06:00:00", 1.0)
-        )
-        == "create"
-    )
-    assert (
-        write_cycle(
-            session.store, virtual_cycle_cube(chunks, "2025-01-01T12:00:00", 2.0)
-        )
-        == "append"
-    )
-    assert (
-        write_cycle(
-            session.store, virtual_cycle_cube(chunks, "2025-01-01T06:00:00", 3.0)
-        )
-        == "region"
-    )
+    assert write_cycle(session, cube("2025-01-01T06:00:00", 1.0)) == "create"
+    assert write_cycle(session, cube("2025-01-02T06:00:00", 3.0)) == "append"
+    # the skipped 12z now has a row waiting, so its late arrival is a region
+    # write rather than an append that would put it after the 2nd of January
+    assert write_cycle(session, cube("2025-01-01T12:00:00", 2.0)) == "region"
 
-    cube = xr.open_zarr(session.store, consolidated=False, zarr_format=3)
+    store = xr.open_zarr(session.store, consolidated=False, zarr_format=3)
+    axis = store.reference_time.values
 
-    assert list(cube.reference_time.values) == [
-        np.datetime64("2025-01-01T06:00:00", "ns"),
-        np.datetime64("2025-01-01T12:00:00", "ns"),
+    assert list(axis) == sorted(axis)
+    assert [str(t) for t in axis] == [
+        "2025-01-01T06:00:00.000000000",
+        "2025-01-01T12:00:00.000000000",
+        "2025-01-02T06:00:00.000000000",
     ]
-    # the re-delivered 06z cycle replaced its row; the 12z row is untouched
-    assert (cube[naqfc.VARIABLE].isel(reference_time=0).values == 3.0).all()
-    assert (cube[naqfc.VARIABLE].isel(reference_time=1).values == 2.0).all()
-    # and the grid coordinates survived a region write that could not carry them
-    assert list(cube.y.values) == [0, 1] and list(cube.x.values) == [0, 1]
+    for row, written in enumerate((1.0, 2.0, 3.0)):
+        assert (store[naqfc.VARIABLE].isel(reference_time=row).values == written).all()
+    # the grid coordinates survived a region write that could not carry them
+    assert list(store.y.values) == [0, 1] and list(store.x.values) == [0, 1]
+
+
+def test_a_reserved_row_costs_nothing_until_its_cycle_arrives(
+    local_repo: Repository, tmp_path: pathlib.Path
+) -> None:
+    """A reserved row is a real reference_time over an empty manifest: it reads
+    as the fill value and stores no chunk at all, which is also how ops can tell
+    a cycle has not landed without fetching a byte."""
+    chunks = tmp_path / "chunks"
+    session = local_repo.writable_session("main")
+    cube = functools.partial(virtual_cycle_cube, chunks)
+
+    write_cycle(session, cube("2025-01-01T06:00:00", 1.0))
+    write_cycle(session, cube("2025-01-02T06:00:00", 3.0))
+
+    store = xr.open_zarr(session.store, consolidated=False, zarr_format=3)
+    assert store.sizes["reference_time"] == 3
+    assert np.isnan(store[naqfc.VARIABLE].isel(reference_time=1).values).all()
+
+    array = f"/{naqfc.VARIABLE}"
+    assert session.chunk_type(array, [1, 0, 0, 0]) == icechunk.ChunkType.uninitialized
+    assert session.chunk_type(array, [0, 0, 0, 0]) == icechunk.ChunkType.virtual
+    assert session.chunk_type(array, [2, 0, 0, 0]) == icechunk.ChunkType.virtual
+
+
+def test_a_reserved_row_survives_a_commit_and_reopen(
+    local_repo: Repository, tmp_path: pathlib.Path
+) -> None:
+    """Committed and read back through a fresh session, so the reserved row is
+    a property of the store rather than of one uncommitted write."""
+    chunks = tmp_path / "chunks"
+    session = local_repo.writable_session("main")
+    cube = functools.partial(virtual_cycle_cube, chunks)
+
+    write_cycle(session, cube("2025-01-01T06:00:00", 1.0))
+    session.commit("create")
+    session = local_repo.writable_session("main")
+    write_cycle(session, cube("2025-01-02T06:00:00", 3.0))
+    session.commit("append over the gap")
+
+    session = local_repo.writable_session("main")
+    assert write_cycle(session, cube("2025-01-01T12:00:00", 2.0)) == "region"
+    session.commit("fill the reserved row")
+
+    store = xr.open_zarr(
+        local_repo.readonly_session("main").store, consolidated=False, zarr_format=3
+    )
+    assert [str(t) for t in store.reference_time.values] == [
+        "2025-01-01T06:00:00.000000000",
+        "2025-01-01T12:00:00.000000000",
+        "2025-01-02T06:00:00.000000000",
+    ]
+    assert (store[naqfc.VARIABLE].isel(reference_time=1).values == 2.0).all()
+
+
+@pytest.mark.network
+def test_out_of_order_cycles_round_trip_through_process_file(
+    naqfc_repo: Repository,
+) -> None:
+    """The same journey through the real path: GRIB from NOAA's bucket, cycles
+    handed to `process_file` in the wrong order."""
+    processor = Processor()
+    session = processor.initialize_session(naqfc_repo)
+    first, second, third = naqfc.cycle_urls("2025-01-01", "2025-01-02", ("06", "12"))[
+        :3
+    ]
+
+    assert processor.process_file(first, session)  # 01 Jan 06z -> create
+    assert processor.process_file(third, session)  # 02 Jan 06z -> append, reserves
+    assert processor.process_file(second, session)  # 01 Jan 12z -> region
+
+    store = xr.open_zarr(session.store, consolidated=False, zarr_format=3)
+    axis = store.reference_time.values
+
+    assert list(axis) == sorted(axis)
+    assert [str(t) for t in axis] == [
+        "2025-01-01T06:00:00.000000000",
+        "2025-01-01T12:00:00.000000000",
+        "2025-01-02T06:00:00.000000000",
+    ]
+    array = f"/{naqfc.VARIABLE}"
+    assert all(
+        session.chunk_type(array, [row, 0, 0, 0]) == icechunk.ChunkType.virtual
+        for row in range(3)
+    )

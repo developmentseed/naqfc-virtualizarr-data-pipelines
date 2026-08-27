@@ -8,7 +8,7 @@ dependencies = [
     # [grib] pulls gribberish, the GRIB2 reader/codec NAQFC files are parsed and
     # decoded with. Reads go through obstore, which virtualizarr already brings.
     "gribberish>=1.7.0",
-    "virtualizarr[grib]>=2.7.1",
+    "virtualizarr[grib]>=2.7.2",
     "zarr>=3.2.1",
 ]
 
