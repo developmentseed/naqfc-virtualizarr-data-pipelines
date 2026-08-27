@@ -28,16 +28,17 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, NamedTuple, cast
+from typing import Any, NamedTuple, cast
 
 import icechunk
+import numpy as np
+import xarray as xr
 from icechunk import ForkSession, Repository, Session
+from virtualizarr.manifests import ChunkManifest, ManifestArray
+from virtualizarr.manifests.manifest import MISSING_CHUNK_PATH
+from zarr.core.metadata import ArrayV3Metadata
 
 from virtualizarr_processor import naqfc
-
-if TYPE_CHECKING:
-    import numpy as np
-    import xarray as xr
 
 logger = logging.getLogger(__name__)
 
@@ -54,11 +55,11 @@ class WritePlan(NamedTuple):
     """How one cycle gets written: `plan.cube.vz.to_icechunk(store, **plan.kwargs)`."""
 
     mode: str  # "create" | "region" | "append"
-    cube: "xr.Dataset"
+    cube: xr.Dataset
     kwargs: dict[str, Any]
 
 
-def store_reference_times(store: Any) -> "np.ndarray | None":
+def store_reference_times(store: Any) -> np.ndarray | None:
     """The `reference_time` axis a store already holds, or None if it holds no
     data yet.
 
@@ -66,8 +67,6 @@ def store_reference_times(store: Any) -> "np.ndarray | None":
     batch adds a row that the next file has to see. A session reads its own
     uncommitted writes, so this stays correct mid-batch.
     """
-    import xarray as xr
-
     try:
         cube = xr.open_zarr(store, consolidated=False, zarr_format=3)
     except Exception:
@@ -75,10 +74,10 @@ def store_reference_times(store: Any) -> "np.ndarray | None":
         return None
     if naqfc.VARIABLE not in cube.variables or "reference_time" not in cube.coords:
         return None
-    return cast("np.ndarray", cube["reference_time"].values)
+    return cast(np.ndarray, cube["reference_time"].values)
 
 
-def _reserve(cube: "xr.Dataset", schedule: "np.ndarray") -> "xr.Dataset":
+def _reserve(cube: xr.Dataset, schedule: np.ndarray) -> xr.Dataset:
     """Place one cycle on `schedule`, reserving a row per cycle not yet here.
 
     Rows the cycle does not cover get no chunk manifest entries at all, so they
@@ -93,24 +92,34 @@ def _reserve(cube: "xr.Dataset", schedule: "np.ndarray") -> "xr.Dataset":
     single row, which kills a 2 GB Lambda before it writes anything. The work
     belongs on the chunk grid instead: one entry per GRIB message, 72 per cycle.
     """
-    import numpy as np
-    import xarray as xr
-    from virtualizarr.manifests import ChunkManifest, ManifestArray
-    from zarr.core.metadata import ArrayV3Metadata
-
     variable = cube[naqfc.VARIABLE]
     array = variable.data
     row = int(np.flatnonzero(schedule == cube["reference_time"].values[0])[0])
 
+    # Start every slot in the padded grid as a missing chunk, then overwrite
+    # only the row the cycle occupies. What remains missing is what gets
+    # reserved -- there is no separate step that creates the empty rows.
+    #
+    # `MISSING_CHUNK_PATH` is the path virtualizarr reads as "no chunk here",
+    # and the path is the only field it consults: the offset and length beside
+    # it are inert. They are zeroed rather than left uninitialized (which is
+    # what `ChunkManifest`'s own `np.empty` would leave) so that two runs over
+    # the same cycle build byte-identical manifests.
+    grid = (len(schedule), *array.manifest.shape_chunk_grid[1:])
+    paths = np.full(grid, MISSING_CHUNK_PATH, dtype=np.dtypes.StringDType())
+    offsets = np.zeros(grid, dtype=np.uint64)
+    lengths = np.zeros(grid, dtype=np.uint64)
+    for key, entry in array.manifest.dict().items():
+        slot = (row, *(int(i) for i in key.split(".")[1:]))
+        paths[slot] = entry["path"]
+        offsets[slot] = entry["offset"]
+        lengths[slot] = entry["length"]
+
     spec = array.metadata.to_dict()
     spec["shape"] = [len(schedule), *array.shape[1:]]
     padded = ManifestArray(
-        chunkmanifest=ChunkManifest(
-            {
-                ".".join([str(row), *key.split(".")[1:]]): entry
-                for key, entry in array.manifest.dict().items()
-            },
-            shape=(len(schedule), *array.manifest.shape_chunk_grid[1:]),
+        chunkmanifest=ChunkManifest.from_arrays(
+            paths=paths, offsets=offsets, lengths=lengths
         ),
         metadata=ArrayV3Metadata.from_dict(spec),
     )
@@ -132,7 +141,7 @@ def _reserve(cube: "xr.Dataset", schedule: "np.ndarray") -> "xr.Dataset":
     )
 
 
-def write_plan(cube: "xr.Dataset", existing: "np.ndarray | None") -> WritePlan:
+def write_plan(cube: xr.Dataset, existing: np.ndarray | None) -> WritePlan:
     """Choose how to write one cycle, given the `reference_time` axis it meets.
 
     Files arrive out of order, so appending whatever turns up leaves the axis

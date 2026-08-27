@@ -18,6 +18,7 @@ from icechunk import Repository
 from virtualizarr_processor import naqfc
 from virtualizarr_processor.processor import (
     Processor,
+    _reserve,
     store_reference_times,
     write_plan,
 )
@@ -265,8 +266,9 @@ def synthetic_cube(
 
     Virtual, not numpy: the real path is always a `ManifestArray`, and placing a
     cycle on the schedule is manifest surgery, so a numpy fixture would exercise
-    a code path that never runs. The chunk paths are never dereferenced -- these
-    tests only inspect the manifest.
+    a code path that never runs. The chunk path is shaped like the real NAQFC
+    key it stands for but is never dereferenced -- these tests only inspect the
+    manifest, never read bytes.
     """
     from virtualizarr.manifests import ChunkManifest, ManifestArray
     from virtualizarr.manifests.utils import create_v3_array_metadata
@@ -282,7 +284,10 @@ def synthetic_cube(
         chunkmanifest=ChunkManifest(
             {
                 f"0.{lead}.0.0": {
-                    "path": "s3://noaa-nws-naqfc-pds/never-read.grib2",
+                    "path": (
+                        "s3://noaa-nws-naqfc-pds/AQMv7/CS/20250101/06/"
+                        "aqm.t06z.ave_1hr_o3.20250101.227.grib2"
+                    ),
                     "offset": lead * 1024,
                     "length": 1024,
                 }
@@ -360,6 +365,35 @@ def test_write_plan_keeps_the_time_encoding_through_the_padding() -> None:
     plan = write_plan(synthetic_cube("2025-01-02T06:00:00"), existing)
 
     assert plan.cube["reference_time"].encoding["units"] == "hours since 1970-01-01"
+
+
+def test_reserved_rows_match_what_virtualizarr_reindex_produces() -> None:
+    """Placing a cycle by hand has to mean exactly what `reindex` means by it.
+
+    `reindex` is the reference implementation -- it is only avoided because it
+    allocates over the element grid -- so the padded array it produces is what
+    this compares against, on a grid small enough to afford it. An empty path is
+    virtualizarr's `MISSING_CHUNK_PATH`, and a manifest reports a missing chunk
+    by having no entry for it at all.
+    """
+    from virtualizarr.manifests.manifest import MISSING_CHUNK_PATH
+
+    schedule = np.array(
+        ["2025-01-01T06:00:00", "2025-01-01T12:00:00", "2025-01-02T06:00:00"],
+        dtype="datetime64[ns]",
+    )
+    cube = synthetic_cube("2025-01-02T06:00:00")
+
+    mine = _reserve(cube, schedule)[naqfc.VARIABLE].data
+    reference = cube.reindex(reference_time=schedule)[naqfc.VARIABLE].data
+
+    assert mine.shape == reference.shape
+    assert mine.metadata.to_dict() == reference.metadata.to_dict()
+    assert mine.manifest.dict() == reference.manifest.dict()
+    assert mine.manifest.shape_chunk_grid == reference.manifest.shape_chunk_grid
+    # only the arriving cycle's row is referenced, in both
+    assert rows_with_chunks(_reserve(cube, schedule)) == {2}
+    assert MISSING_CHUNK_PATH == ""
 
 
 def test_reserving_rows_costs_the_chunk_grid_not_the_element_grid() -> None:
