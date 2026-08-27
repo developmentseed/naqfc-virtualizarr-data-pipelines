@@ -79,17 +79,57 @@ def store_reference_times(store: Any) -> "np.ndarray | None":
 
 
 def _reserve(cube: "xr.Dataset", schedule: "np.ndarray") -> "xr.Dataset":
-    """Spread one cycle over `schedule`, reserving a row per cycle not yet here.
+    """Place one cycle on `schedule`, reserving a row per cycle not yet here.
 
-    `reindex` is what makes this cheap: the rows it invents get no entries in
-    the chunk manifest at all, so they cost nothing to store and read back as
-    the array's fill value. Nothing is materialized -- the cycle's own chunks
-    stay virtual references into NOAA's bucket.
+    Rows the cycle does not cover get no chunk manifest entries at all, so they
+    cost nothing to store and read back as the array's fill value. They exist to
+    hold an address: a straggler that lands later is a region write into the row
+    already waiting for it rather than an append out of order.
 
-    Re-pins the time encoding afterwards, which `reindex` does not carry over;
-    without it the appended block infers its own units and reads back wrong.
+    Deliberately *not* `cube.reindex(reference_time=schedule)`, which is the
+    obvious spelling and the one the prototype used. xarray builds its reindex
+    indexer over the array's element shape, and at NAQFC's grid that is
+    72 x 1473 x 1025 per row -- ~1 GB of transient allocation to reserve a
+    single row, which kills a 2 GB Lambda before it writes anything. The work
+    belongs on the chunk grid instead: one entry per GRIB message, 72 per cycle.
     """
-    return naqfc.pin_time_encoding(cube.reindex(reference_time=schedule))
+    import numpy as np
+    import xarray as xr
+    from virtualizarr.manifests import ChunkManifest, ManifestArray
+    from zarr.core.metadata import ArrayV3Metadata
+
+    variable = cube[naqfc.VARIABLE]
+    array = variable.data
+    row = int(np.flatnonzero(schedule == cube["reference_time"].values[0])[0])
+
+    spec = array.metadata.to_dict()
+    spec["shape"] = [len(schedule), *array.shape[1:]]
+    padded = ManifestArray(
+        chunkmanifest=ChunkManifest(
+            {
+                ".".join([str(row), *key.split(".")[1:]]): entry
+                for key, entry in array.manifest.dict().items()
+            },
+            shape=(len(schedule), *array.manifest.shape_chunk_grid[1:]),
+        ),
+        metadata=ArrayV3Metadata.from_dict(spec),
+    )
+
+    # Every other coordinate spans lead/y/x only, so it carries over untouched --
+    # which is also why none of them needs a row reserving.
+    coords: dict[Any, Any] = {
+        name: cube[name]
+        for name in cube.coords
+        if "reference_time" not in cube[name].dims
+    }
+    coords["reference_time"] = ("reference_time", schedule)
+    return naqfc.pin_time_encoding(
+        xr.Dataset(
+            {naqfc.VARIABLE: xr.Variable(naqfc.DIMS, padded, attrs=variable.attrs)},
+            coords=coords,
+            attrs=cube.attrs,
+        )
+    )
 
 
 def write_plan(cube: "xr.Dataset", existing: "np.ndarray | None") -> WritePlan:

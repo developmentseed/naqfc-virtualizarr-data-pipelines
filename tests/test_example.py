@@ -258,22 +258,56 @@ def test_a_cycle_off_the_hour_is_refused() -> None:
 # --- placing a cycle on the axis -------------------------------------------
 
 
-def synthetic_cube(reference_time: str) -> xr.Dataset:
-    """A cycle cube's shape without the GRIB: same dims, coords and variable
-    name as `naqfc.cycle_cube`, so the write-mode rules can be checked offline."""
-    lead = np.arange(1, 4, dtype="int32")
-    return xr.Dataset(
-        {naqfc.VARIABLE: (naqfc.DIMS, np.zeros((1, len(lead), 2, 2), dtype="float32"))},
+def synthetic_cube(
+    reference_time: str, n_lead: int = 3, ny: int = 2, nx: int = 2
+) -> xr.Dataset:
+    """A cycle cube's structure without the GRIB or the bytes.
+
+    Virtual, not numpy: the real path is always a `ManifestArray`, and placing a
+    cycle on the schedule is manifest surgery, so a numpy fixture would exercise
+    a code path that never runs. The chunk paths are never dereferenced -- these
+    tests only inspect the manifest.
+    """
+    from virtualizarr.manifests import ChunkManifest, ManifestArray
+    from virtualizarr.manifests.utils import create_v3_array_metadata
+
+    array = ManifestArray(
+        metadata=create_v3_array_metadata(
+            shape=(1, n_lead, ny, nx),
+            data_type=np.dtype("float32"),
+            chunk_shape=(1, 1, ny, nx),
+            fill_value=np.nan,
+            dimension_names=naqfc.DIMS,
+        ),
+        chunkmanifest=ChunkManifest(
+            {
+                f"0.{lead}.0.0": {
+                    "path": "s3://noaa-nws-naqfc-pds/never-read.grib2",
+                    "offset": lead * 1024,
+                    "length": 1024,
+                }
+                for lead in range(n_lead)
+            }
+        ),
+    )
+    cube = xr.Dataset(
+        {naqfc.VARIABLE: xr.Variable(naqfc.DIMS, array)},
         coords={
             "reference_time": (
                 "reference_time",
                 np.array([reference_time], dtype="datetime64[ns]"),
             ),
-            "lead": ("lead", lead),
-            "y": ("y", np.arange(2)),
-            "x": ("x", np.arange(2)),
+            "lead": ("lead", np.arange(1, n_lead + 1, dtype="int32")),
+            "y": ("y", np.arange(ny)),
+            "x": ("x", np.arange(nx)),
         },
     )
+    return naqfc.pin_time_encoding(cube)
+
+
+def rows_with_chunks(cube: xr.Dataset) -> set[int]:
+    """Which reference_time rows carry chunk references at all."""
+    return {int(key.split(".")[0]) for key in cube[naqfc.VARIABLE].data.manifest.dict()}
 
 
 def test_write_plan_creates_when_the_store_is_empty() -> None:
@@ -312,19 +346,39 @@ def test_write_plan_reserves_a_row_for_every_cycle_it_skipped() -> None:
         "2025-01-01T12:00:00.000000000",
         "2025-01-02T06:00:00.000000000",
     ]
-    # and the arriving cycle is in the row that belongs to it, not the first one
-    assert not np.isnan(plan.cube[naqfc.VARIABLE].values[1]).any()
-    assert np.isnan(plan.cube[naqfc.VARIABLE].values[0]).all()
+    # the arriving cycle sits in the row that belongs to it, and the reserved
+    # row holds no chunk references at all -- it costs nothing until its file
+    # lands, and reads back as the array's fill value until then
+    assert rows_with_chunks(plan.cube) == {1}
 
 
-def test_write_plan_keeps_the_time_encoding_through_the_reindex() -> None:
-    """reindex does not carry encoding over, and a block written without it
-    infers `days since <first row>` and reads back wrong by a factor of 24."""
+def test_write_plan_keeps_the_time_encoding_through_the_padding() -> None:
+    """A block written without the encoding infers `days since <first row>`
+    and reads back wrong by a factor of 24."""
     existing = np.array(["2025-01-01T06:00:00"], dtype="datetime64[ns]")
 
     plan = write_plan(synthetic_cube("2025-01-02T06:00:00"), existing)
 
     assert plan.cube["reference_time"].encoding["units"] == "hours since 1970-01-01"
+
+
+def test_reserving_rows_costs_the_chunk_grid_not_the_element_grid() -> None:
+    """At the real CONUS dimensions, reserving rows the obvious way -- xarray's
+    `reindex` -- allocates over 72 x 1473 x 1025 elements per row, about a
+    gigabyte each, which kills a 2 GB Lambda before it writes anything. Placing
+    a cycle on the schedule has to stay manifest-level: 72 entries per cycle
+    whatever the grid underneath. These dimensions are the point of the test."""
+    existing = np.array(["2025-01-01T06:00:00"], dtype="datetime64[ns]")
+    cube = synthetic_cube("2025-01-04T06:00:00", n_lead=72, ny=1473, nx=1025)
+
+    plan = write_plan(cube, existing)
+
+    assert plan.cube.sizes["reference_time"] == 6
+    assert plan.cube[naqfc.VARIABLE].shape == (6, 72, 1473, 1025)
+    # only the arriving cycle's own row is referenced; the five reserved rows
+    # hold nothing, so the manifest stays the size of a single cycle
+    assert rows_with_chunks(plan.cube) == {5}
+    assert len(plan.cube[naqfc.VARIABLE].data.manifest.dict()) == 72
 
 
 def test_write_plan_refuses_a_cycle_older_than_the_store() -> None:
