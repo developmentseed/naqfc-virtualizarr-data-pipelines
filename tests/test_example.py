@@ -6,6 +6,7 @@ inventory both derive from, and the cube reshaping rules. The round trips that
 genuinely need bytes from NOAA's bucket are marked `network`.
 """
 
+import functools
 import pathlib
 from datetime import datetime, timedelta, timezone
 
@@ -17,6 +18,7 @@ from icechunk import Repository
 from virtualizarr_processor import naqfc
 from virtualizarr_processor.processor import (
     Processor,
+    sort_reference_time,
     store_reference_times,
     write_plan,
 )
@@ -326,7 +328,10 @@ def virtual_cycle_cube(
     ny = nx = 2
     data = np.full((n_lead, ny, nx), value, dtype="float32")
     chunk_bytes = data[0].nbytes
-    path = chunks / f"{reference_time.replace(':', '')}.bin"
+    # Keyed by value as well as cycle: two cubes for the same cycle with
+    # different values must not share a backing file, or writing the second
+    # rewrites bytes the first's references already point at.
+    path = chunks / f"{reference_time.replace(':', '')}-{value:g}.bin"
     path.write_bytes(data.tobytes())
 
     dtype = parse_data_type(data.dtype, zarr_format=3)
@@ -416,3 +421,139 @@ def test_forward_writes_create_then_append_then_region(
     assert (cube[naqfc.VARIABLE].isel(reference_time=1).values == 2.0).all()
     # and the grid coordinates survived a region write that could not carry them
     assert list(cube.y.values) == [0, 1] and list(cube.x.values) == [0, 1]
+
+
+# --- putting an out-of-order axis back in order -----------------------------
+
+
+def axis_of(session: icechunk.Session) -> list[str]:
+    store = xr.open_zarr(session.store, consolidated=False, zarr_format=3)
+    return [str(t) for t in store.reference_time.values]
+
+
+def test_sorting_an_ordered_axis_is_a_no_op(
+    local_repo: Repository, tmp_path: pathlib.Path
+) -> None:
+    """`reindex_array` visits every chunk even when the permutation is the
+    identity, and dirties the session doing it, so the ordered case -- which is
+    almost every batch -- has to short-circuit before reaching it."""
+    chunks = tmp_path / "chunks"
+    session = local_repo.writable_session("main")
+    cube = functools.partial(virtual_cycle_cube, chunks)
+
+    write_cycle(session.store, cube("2025-01-01T06:00:00", 1.0))
+    write_cycle(session.store, cube("2025-01-01T12:00:00", 2.0))
+    Processor().commit_processed_files(session)
+
+    session = local_repo.writable_session("main")
+    assert sort_reference_time(session) == 0
+    assert not session.has_uncommitted_changes
+
+
+def test_cycles_appended_out_of_order_are_sorted_before_the_commit(
+    local_repo: Repository, tmp_path: pathlib.Path
+) -> None:
+    """The whole point: a batch arrives jumbled, every cycle is appended where
+    it falls, and the snapshot that lands is in order with each row holding its
+    own forecast."""
+    chunks = tmp_path / "chunks"
+    session = local_repo.writable_session("main")
+    cube = functools.partial(virtual_cycle_cube, chunks)
+
+    assert write_cycle(session.store, cube("2025-01-02T06:00:00", 3.0)) == "create"
+    assert write_cycle(session.store, cube("2025-01-01T06:00:00", 1.0)) == "append"
+    assert write_cycle(session.store, cube("2025-01-01T12:00:00", 2.0)) == "append"
+
+    # mid-session the axis is in arrival order, which is exactly why the sort
+    # has to happen before the commit rather than after it
+    assert axis_of(session) == [
+        "2025-01-02T06:00:00.000000000",
+        "2025-01-01T06:00:00.000000000",
+        "2025-01-01T12:00:00.000000000",
+    ]
+
+    Processor().commit_processed_files(session)
+
+    store = xr.open_zarr(
+        local_repo.readonly_session("main").store, consolidated=False, zarr_format=3
+    )
+    assert [str(t) for t in store.reference_time.values] == [
+        "2025-01-01T06:00:00.000000000",
+        "2025-01-01T12:00:00.000000000",
+        "2025-01-02T06:00:00.000000000",
+    ]
+    # each row carries its own cycle's data, not just a sorted coordinate
+    for row, written in enumerate((1.0, 2.0, 3.0)):
+        assert (store[naqfc.VARIABLE].isel(reference_time=row).values == written).all()
+
+
+def test_a_cycle_older_than_the_whole_store_is_accepted(
+    local_repo: Repository, tmp_path: pathlib.Path
+) -> None:
+    """Zarr can only grow an axis at its end, so a cycle older than everything
+    in the store has nowhere to be inserted. Appending it and sorting afterwards
+    puts it at row 0 regardless -- the case a placement-based write has to
+    refuse outright."""
+    chunks = tmp_path / "chunks"
+    cube = functools.partial(virtual_cycle_cube, chunks)
+
+    session = local_repo.writable_session("main")
+    write_cycle(session.store, cube("2025-06-01T06:00:00", 5.0))
+    Processor().commit_processed_files(session)
+
+    session = local_repo.writable_session("main")
+    assert write_cycle(session.store, cube("2025-01-01T06:00:00", 1.0)) == "append"
+    Processor().commit_processed_files(session)
+
+    store = xr.open_zarr(
+        local_repo.readonly_session("main").store, consolidated=False, zarr_format=3
+    )
+    assert [str(t) for t in store.reference_time.values] == [
+        "2025-01-01T06:00:00.000000000",
+        "2025-06-01T06:00:00.000000000",
+    ]
+    assert (store[naqfc.VARIABLE].isel(reference_time=0).values == 1.0).all()
+    assert (store[naqfc.VARIABLE].isel(reference_time=1).values == 5.0).all()
+
+
+def test_every_committed_snapshot_is_ordered(
+    local_repo: Repository, tmp_path: pathlib.Path
+) -> None:
+    """Commit by commit, not just at the end: a reader taking any snapshot must
+    never see an axis in arrival order."""
+    chunks = tmp_path / "chunks"
+    cube = functools.partial(virtual_cycle_cube, chunks)
+    arrivals = [
+        ("2025-01-02T12:00:00", 4.0),
+        ("2025-01-01T06:00:00", 1.0),
+        ("2025-01-02T06:00:00", 3.0),
+        ("2025-01-01T12:00:00", 2.0),
+    ]
+
+    for stamp, value in arrivals:
+        session = local_repo.writable_session("main")
+        write_cycle(session.store, cube(stamp, value))
+        Processor().commit_processed_files(session)
+
+        committed = axis_of(local_repo.readonly_session("main"))
+        assert committed == sorted(committed), f"unordered after {stamp}"
+
+
+def test_a_duplicate_cycle_is_refused_rather_than_guessed_at(
+    local_repo: Repository, tmp_path: pathlib.Path
+) -> None:
+    """`write_plan` region-writes a cycle already on the axis, so a duplicate
+    means something bypassed it. No sort can make the axis strictly increasing,
+    and choosing a copy to drop would lose a forecast."""
+    chunks = tmp_path / "chunks"
+    session = local_repo.writable_session("main")
+    cube = functools.partial(virtual_cycle_cube, chunks)
+
+    write_cycle(session.store, cube("2025-01-01T06:00:00", 1.0))
+    # bypass write_plan to force the duplicate a correct caller cannot create
+    cube("2025-01-01T06:00:00", 9.0).vz.to_icechunk(
+        session.store, append_dim="reference_time"
+    )
+
+    with pytest.raises(ValueError, match="duplicate cycles"):
+        sort_reference_time(session)
