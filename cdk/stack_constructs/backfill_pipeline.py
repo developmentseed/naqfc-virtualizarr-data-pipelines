@@ -1,6 +1,6 @@
 from typing import Any
 
-from aws_cdk import Aws, Duration
+from aws_cdk import Duration
 from aws_cdk import aws_ecr_assets as ecr_assets
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_lambda as lmb
@@ -29,7 +29,9 @@ class BackfillPipeline(Construct):
         construct_id: str,
         *,
         icechunk_bucket: s3.IBucket,
+        backfill_bucket: s3.IBucket,
         icechunk_prefix: str | None,
+        icechunk_region: str | None = None,
         data_bucket_name: str,
         earthdata_secret_arn: str | None = None,
         partition_size: int,
@@ -45,8 +47,9 @@ class BackfillPipeline(Construct):
         # keys when set so synth doesn't inject a None value.
         env = {
             "ICECHUNK_BUCKET": icechunk_bucket.bucket_name,
-            "ICECHUNK_REGION": Aws.REGION,
         }
+        if icechunk_region:
+            env["ICECHUNK_REGION"] = icechunk_region
         if icechunk_prefix:
             env["ICECHUNK_PREFIX"] = icechunk_prefix
         if earthdata_secret_arn:
@@ -82,6 +85,7 @@ class BackfillPipeline(Construct):
                 environment=dict(env),
             )
             icechunk_bucket.grant_read_write(fn)
+            backfill_bucket.grant_read_write(fn)
             # Handlers that open the repo need to read the Earthdata secret.
             if earthdata_secret is not None and action in _REPO_ACTIONS:
                 earthdata_secret.grant_read(fn)
@@ -100,12 +104,12 @@ class BackfillPipeline(Construct):
         self.functions["partition"].add_to_role_policy(data_policy)
 
         self.state_machine = self._build_state_machine(
-            icechunk_bucket, partition_size, max_items_per_batch, max_concurrency
+            backfill_bucket, partition_size, max_items_per_batch, max_concurrency
         )
 
     def _build_state_machine(
         self,
-        icechunk_bucket: s3.IBucket,
+        backfill_bucket: s3.IBucket,
         partition_size: int,
         max_items_per_batch: int,
         max_concurrency: int,
@@ -119,7 +123,7 @@ class BackfillPipeline(Construct):
                     "inventory_uri": sfn.JsonPath.string_at("$.inventory_uri"),
                     "run_prefix": sfn.JsonPath.format(
                         "s3://{}/backfill/{}/",
-                        icechunk_bucket.bucket_name,
+                        backfill_bucket.bucket_name,
                         sfn.JsonPath.string_at("$$.Execution.Name"),
                     ),
                     "partition_size": partition_size,
@@ -166,7 +170,10 @@ class BackfillPipeline(Construct):
             self,
             "InnerMap",
             item_reader=sfn.S3JsonItemReader(
-                bucket=icechunk_bucket,
+                # This reader takes no region and assumes the stack's own, which
+                # is why the manifests live here rather than in the Icechunk
+                # bucket: that one may be in another region entirely.
+                bucket=backfill_bucket,
                 # manifest_key comes from the partition item ($ here is the outer
                 # Map iteration state); the fork result does not carry it.
                 key=sfn.JsonPath.string_at("$.manifest_key"),
