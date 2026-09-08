@@ -34,6 +34,11 @@ class StackSettings(BaseSettings):
     # repo at an empty prefix (bucket root), so this must be non-empty to bootstrap
     # a new store. Passed into the Lambda env as ICECHUNK_PREFIX.
     ICECHUNK_PREFIX: str | None = None
+    # Region of the Icechunk bucket, passed into the Lambda env as
+    # ICECHUNK_REGION. Only needed when the bucket is not in the region the
+    # stack is deployed into: left unset, no ICECHUNK_REGION reaches the
+    # handlers and icechunk resolves the region from the running Lambda.
+    ICECHUNK_REGION: str | None = None
     DATA_BUCKET_NAME: str | None = None
     PROJECT: str = "virtualizarr-data-pipelines"
     SNS_TOPIC: str | None = None
@@ -61,6 +66,16 @@ class StackSettings(BaseSettings):
 
     # Backfill (partitioned fork/merge) pipeline
     BACKFILL_ENABLED: bool = False
+    # Bucket for backfill artifacts: the inventory, the partition manifests and
+    # the pickled forks. Separate from the Icechunk bucket because
+    # StepFunctions' S3JsonItemReader takes no region and assumes the stack's
+    # own, so it cannot read manifests out of a bucket in another region. A
+    # bucket this stack creates is always in-region; adopt an existing one with
+    # BACKFILL_BUCKET only if you know it is local to the deployment.
+    # S3 bucket names are globally unique, so BACKFILL_BUCKET_NAME has to be
+    # changed from its default for a fresh deploy to succeed.
+    BACKFILL_BUCKET_NAME: str = "backfill-artifacts"
+    BACKFILL_BUCKET: str | None = None
     BACKFILL_PARTITION_SIZE: int = 500
     BACKFILL_MAX_ITEMS_PER_BATCH: int = 10
     BACKFILL_MAX_CONCURRENCY: int = 50
