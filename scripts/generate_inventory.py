@@ -20,6 +20,12 @@ model: one stack per (domain, product) pair, each with its own store. The grid
 follows the domain (CS=227 Lambert, AK=198 polar stereographic, HI=196
 Mercator), so selecting a domain is enough.
 
+``--bias-corrected`` targets the bias-corrected variant of each product, which
+NOAA publishes alongside the raw one with a ``_bc`` suffix (``ave_1hr_o3`` ->
+``ave_1hr_o3_bc``). It is a separate product, so it gets its own inventory and,
+downstream, its own stack and store. Bias correction is only produced for CONUS
+(CS); AK and HI have no ``_bc`` files.
+
 Usage:
     uv run scripts/generate_inventory.py
     uv run scripts/generate_inventory.py --verify \
@@ -28,6 +34,8 @@ Usage:
         --products ave_1hr_o3 ave_1hr_pm25
     uv run scripts/generate_inventory.py --start 2025-06-01 --end 2025-06-30 \
         --domains CS --products ave_1hr_o3
+    uv run scripts/generate_inventory.py --bias-corrected --verify \
+        --domains CS --products ave_1hr_o3 ave_1hr_pm25
 """
 
 from __future__ import annotations
@@ -47,6 +55,11 @@ from virtualizarr_processor import naqfc
 
 DEFAULT_PRODUCTS = (naqfc.PRODUCT,)
 DEFAULT_DOMAINS = (naqfc.DOMAIN,)
+
+# Bias-corrected products are the raw product name plus this suffix, and exist
+# only for the domains listed here.
+BIAS_CORRECTED_SUFFIX = "_bc"
+BIAS_CORRECTED_DOMAINS = frozenset({"CS"})
 
 # Matches BACKFILL_PARTITION_SIZE's default in cdk/settings.py; used only to
 # report how many commits the inventory will produce.
@@ -141,6 +154,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--cycles", nargs="+", default=list(naqfc.CYCLES))
     parser.add_argument("--products", nargs="+", default=list(DEFAULT_PRODUCTS))
+    parser.add_argument(
+        "--bias-corrected",
+        action="store_true",
+        help=f"use the bias-corrected variant of each --products value (appends "
+        f"'{BIAS_CORRECTED_SUFFIX}'). Only available for "
+        f"{sorted(BIAS_CORRECTED_DOMAINS)}.",
+    )
     parser.add_argument("--out-dir", type=Path, default=Path("inventory"))
     parser.add_argument(
         "--verify",
@@ -169,6 +189,21 @@ def main() -> None:
     cycles = tuple(args.cycles)
     days = naqfc.days(args.start, args.end)
 
+    products = list(args.products)
+    if args.bias_corrected:
+        unsupported = sorted(set(args.domains) - BIAS_CORRECTED_DOMAINS)
+        if unsupported:
+            raise SystemExit(
+                f"--bias-corrected: no bias-corrected files exist for {unsupported}; "
+                f"only {sorted(BIAS_CORRECTED_DOMAINS)} is supported"
+            )
+        # Tolerate a product already given with the suffix rather than
+        # producing `..._bc_bc`, which would match nothing.
+        products = [
+            p if p.endswith(BIAS_CORRECTED_SUFFIX) else p + BIAS_CORRECTED_SUFFIX
+            for p in products
+        ]
+
     for domain in args.domains:
         # Grid and domain are not independent (CS=227 Lambert, AK=198 polar
         # stereographic, HI=196 Mercator). Deriving it here is what keeps
@@ -186,7 +221,7 @@ def main() -> None:
             print(f"\n{domain}: verifying against {len(prefixes)} day prefix(es)...")
             existing = list_existing(prefixes, args.workers)
 
-        for product in args.products:
+        for product in products:
             print(f"\n{domain} / {product} (grid {grid}):")
             uris = naqfc.cycle_urls(
                 args.start,
